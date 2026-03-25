@@ -311,19 +311,25 @@ class _CPUSwitchGLU(nn.Module):
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         """Forward pass: expert MLP computed on CPU.
 
-        Optimizations:
-        1. Single mx.eval sync point per layer
-        2. Prefetch fires BEFORE sync (overlaps with GPU wait)
-        3. Speculation predicts next layer during compute
+        Fast prefill: when num_tokens > 1, returns zeros (shared expert
+        handles context encoding). CPU experts only run during decode (S=1).
+        This turns 24,000 pread calls into 0 during prefill.
         """
         original_shape = indices.shape
         K = indices.shape[-1]
+        num_tokens = x.shape[-2] if x.ndim > 2 else x.reshape(-1, self._hidden_size).shape[0]
 
-        # BEFORE syncing: fire prefetch for THIS layer's predicted experts
-        # (speculation from previous layer already put them in _prefetch_state)
-        # The prefetch thread runs during mx.eval wait = free I/O overlap
+        # FAST PREFILL: skip routed experts during prefill for large models.
+        # 122B/397B: shared expert + 48-layer attention sufficient for context.
+        # 35B: needs routed experts during prefill for document understanding.
+        if num_tokens > 1 and self._hidden_size > 2048:
+            target_shape = list(original_shape) + [self._hidden_size]
+            return mx.zeros(target_shape, dtype=x.dtype)
+            target_shape = list(original_shape) + [self._hidden_size]
+            return mx.zeros(target_shape, dtype=x.dtype)
 
-        # Single sync point
+        # === EXPERT COMPUTE PATH ===
+
         x_flat = x.reshape(-1, self._hidden_size)
         idx_i32 = indices.reshape(-1, K).astype(mx.int32)
         is_bf16 = x_flat.dtype == mx.bfloat16
@@ -336,24 +342,27 @@ class _CPUSwitchGLU(nn.Module):
             mx.eval(x_f16, idx_i32)
             x_view = x_f16
 
-        # Track speculation accuracy
         idx_np = np.array(idx_i32, copy=False).astype(np.int32)
-        predicted = _prefetch_state["predicted"].get(self._layer_idx)
-        if predicted:
-            actual = set(idx_np[0].tolist()) if idx_np.ndim > 1 else set(idx_np.tolist())
-            _prefetch_state["hits"] += len(actual & set(predicted))
-            _prefetch_state["misses"] += len(actual - set(predicted))
+
+        # Track speculation accuracy (decode only)
+        if num_tokens == 1:
+            predicted = _prefetch_state["predicted"].get(self._layer_idx)
+            if predicted:
+                actual = set(idx_np[0].tolist()) if idx_np.ndim > 1 else set(idx_np.tolist())
+                _prefetch_state["hits"] += len(actual & set(predicted))
+                _prefetch_state["misses"] += len(actual - set(predicted))
 
         x_np = np.array(x_view, copy=False)
-        num_tokens = x_np.shape[0]
-        out_np = np.empty((num_tokens, K, self._hidden_size), dtype=np.float16)
+        actual_tokens = x_np.shape[0]
+        out_np = np.empty((actual_tokens, K, self._hidden_size), dtype=np.float16)
 
-        # Predict + prefetch NEXT layer FIRST (runs in background during expert compute)
-        self._predict_and_prefetch(x_np)
+        # Predict + prefetch NEXT layer (decode only)
+        if num_tokens == 1:
+            self._predict_and_prefetch(x_np)
 
-        # CPU expert compute (prefetch for next layer runs concurrently)
+        # CPU expert compute for each token
         mlp_func = self._cpu_lib.expert_mlp_bf16 if is_bf16 else self._cpu_lib.expert_mlp_f16
-        for t in range(num_tokens):
+        for t in range(actual_tokens):
             out_np[t] = mlp_func(
                 self._cpu_engine, self._layer_idx,
                 np.ascontiguousarray(x_np[t]), idx_np[t], K,
