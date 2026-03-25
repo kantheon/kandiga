@@ -1651,7 +1651,7 @@ int bakan_full_forward(void* engine, int token_id, int position,
                 [enc setBuffer:e->expert_output      offset:0 atIndex:2];
                 [enc setBuffer:e->expert_params_buf  offset:0 atIndex:3];
                 [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)K, 1, 1)
-                   threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+                   threadsPerThreadgroup:MTLSizeMake(EXPERT_DIM, 1, 1)];
 
                 // Shared expert up + gate + SwiGLU
                 layer_weight_name(wn, sizeof(wn), layer, "mlp.shared_expert.gate_proj.weight");
@@ -2384,7 +2384,7 @@ int bakan_full_prefill(void* engine, const int32_t* token_ids, int num_tokens,
                     [enc setBuffer:e->expert_output      offset:0 atIndex:2];
                     [enc setBuffer:e->expert_params_buf  offset:0 atIndex:3];
                     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)K, 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+                       threadsPerThreadgroup:MTLSizeMake(EXPERT_DIM, 1, 1)];
 
                     // Shared expert up + gate + SwiGLU
                     layer_weight_name(wn, sizeof(wn), layer, "mlp.shared_expert.gate_proj.weight");

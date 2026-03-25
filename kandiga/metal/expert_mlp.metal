@@ -260,10 +260,10 @@ kernel void expert_mlp_fused(
     if (expert_k >= uint(params.num_experts)) return;
 
     // --- Cooperative load of input x into shared memory ---
-    threadgroup half x_shared[4096]; // max hidden_size (2048 used)
+    threadgroup half x_shared[4096]; // max hidden_size (3072 for 122B, 4096 headroom)
     uint in_dim = uint(params.hidden_size);
-    // 512 threads loading 2048 elements = 4 elements per thread
-    for (uint i = tid; i < in_dim; i += 512) {
+    uint tg_size = uint(params.expert_dim); // threads per threadgroup = expert_dim
+    for (uint i = tid; i < in_dim; i += tg_size) {
         x_shared[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -276,9 +276,9 @@ kernel void expert_mlp_fused(
     uint sb_row_stride = in_dim / group_size;
 
     // === Phase 1: up_proj + gate_proj + SwiGLU ===
-    // Each thread handles one row (one element of expert_dim=512)
-    uint row = tid;  // 0..511
-    threadgroup float shared_activated[512];
+    // Each thread handles one row (one element of expert_dim)
+    uint row = tid;
+    threadgroup float shared_activated[1024]; // expert_dim for 122B
 
     if (row < uint(params.expert_dim)) {
         // gate_proj dot product
@@ -301,10 +301,10 @@ kernel void expert_mlp_fused(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // === Phase 2: down_proj ===
-    // 512 threads handle 2048 output rows (4 rows per thread)
+    // expert_dim threads handle hidden_size output rows
     uint hidden_size = uint(params.hidden_size);
-    uint expert_dim = uint(params.expert_dim);    // 512
-    uint rows_per_thread = hidden_size / 512;     // 2048/512 = 4
+    uint expert_dim = uint(params.expert_dim);
+    uint rows_per_thread = (hidden_size + tg_size - 1) / tg_size;
 
     uint dw_row_stride = expert_dim / 8;          // 512/8 = 64
     uint dsb_row_stride = expert_dim / group_size; // 512/64 = 8
@@ -318,6 +318,7 @@ kernel void expert_mlp_fused(
 
     for (uint r = 0; r < rows_per_thread; r++) {
         uint out_row = tid * rows_per_thread + r;
+        if (out_row >= hidden_size) break;
 
         device const uint32_t* w_row = dw_base + out_row * dw_row_stride;
         device const bfloat* s_row = ds_base + out_row * dsb_row_stride;
