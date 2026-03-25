@@ -1,6 +1,6 @@
 [project]
 name = "kandiga"
-version = "0.3.0"
+version = "0.3.1"
 description = "Run frontier MoE models on consumer hardware. 35B in 1.5GB RAM."
 readme = "README.md"
 requires-python = ">=3.9"

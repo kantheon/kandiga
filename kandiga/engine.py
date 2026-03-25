@@ -407,17 +407,17 @@ class KandigaEngine:
 
     def _stream_generate(self, formatted_prompt: str, max_tokens: int, temp: float):
         """Stream tokens using mlx_lm's generate with a callback."""
-        from mlx_lm.utils import stream_generate, GenerationResponse
-
-        # Tokenize the prompt
-        prompt_tokens = mx.array(self._tokenizer.encode(formatted_prompt))
+        try:
+            from mlx_lm.utils import stream_generate
+        except ImportError:
+            from mlx_lm import stream_generate
 
         sampler = make_sampler(temp=temp)
 
         for response in stream_generate(
             self._model,
-            prompt_tokens,
             self._tokenizer,
+            formatted_prompt,
             max_tokens=max_tokens,
             sampler=sampler,
         ):

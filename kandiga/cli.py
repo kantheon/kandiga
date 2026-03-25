@@ -85,11 +85,23 @@ def main():
     parser.add_argument(
         "--fast", action="store_true", help="K=4 mode"
     )
-    parser.add_argument(
-        "prompt", nargs="*", help="One-shot prompt (omit to enter interactive chat)"
-    )
 
-    args = parser.parse_args()
+    # Check if any arg is a known subcommand
+    known_commands = {"setup", "chat", "serve", "bench", "update", "changelog"}
+    has_subcommand = any(a in known_commands for a in sys.argv[1:])
+
+    if not has_subcommand and len(sys.argv) > 1 and not all(a.startswith("-") for a in sys.argv[1:]):
+        # One-shot mode: treat non-flag args as prompt
+        fast = "--fast" in sys.argv
+        prompt_words = [a for a in sys.argv[1:] if not a.startswith("-")]
+        args = argparse.Namespace(
+            command=None, version=False, fast=fast, prompt=prompt_words
+        )
+    else:
+        parser.add_argument(
+            "prompt", nargs="*", help="One-shot prompt"
+        )
+        args = parser.parse_args()
 
     # --version
     if args.version:
