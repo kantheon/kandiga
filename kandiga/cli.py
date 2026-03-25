@@ -34,8 +34,8 @@ def main():
     )
     setup_parser.add_argument(
         "--model",
-        default="mlx-community/Qwen3.5-35B-A3B-4bit",
-        help="HuggingFace model ID (default: Qwen3.5-35B-A3B-4bit)",
+        default=None,
+        help="HuggingFace model ID (omit to choose interactively)",
     )
 
     # kandiga chat

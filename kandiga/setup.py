@@ -7,18 +7,117 @@ import sys
 import time
 
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+from rich.table import Table
+from rich.prompt import Prompt
 
 console = Console()
 
 EXPERT_CACHE_DIR = os.path.expanduser("~/.kandiga/experts")
 
+MODELS = [
+    {
+        "id": "mlx-community/Qwen3.5-35B-A3B-4bit",
+        "name": "Qwen3.5-35B",
+        "params": "35B (3B active)",
+        "experts": "256 total, 8 active",
+        "disk": "20 GB",
+        "ram": "~2 GB",
+        "min_mac": "8 GB",
+        "speed": "3.4–6.5 tok/s",
+    },
+    {
+        "id": "mlx-community/Qwen3.5-122B-A10B-4bit",
+        "name": "Qwen3.5-122B",
+        "params": "122B (10B active)",
+        "experts": "256 total, 8 active",
+        "disk": "70 GB",
+        "ram": "~4 GB",
+        "min_mac": "16 GB",
+        "speed": "~2 tok/s",
+    },
+    {
+        "id": "mlx-community/Qwen3.5-397B-A17B-4bit",
+        "name": "Qwen3.5-397B",
+        "params": "397B (17B active)",
+        "experts": "512 total, 10 active",
+        "disk": "224 GB",
+        "ram": "~8 GB",
+        "min_mac": "24 GB",
+        "speed": "~1 tok/s",
+    },
+]
 
-def run_setup(model_path: str = "mlx-community/Qwen3.5-35B-A3B-4bit"):
+
+def _get_system_ram_gb() -> int:
+    """Get total system RAM in GB."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True
+        )
+        return int(result.stdout.strip()) // (1024 ** 3)
+    except Exception:
+        return 0
+
+
+def _pick_model() -> str:
+    """Interactive model picker."""
+    ram_gb = _get_system_ram_gb()
+
+    console.print("[bold cyan]Available Models[/]\n")
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("#", style="cyan", width=3)
+    table.add_column("Model", style="bold")
+    table.add_column("Parameters")
+    table.add_column("Disk")
+    table.add_column("RAM (Kandiga)")
+    table.add_column("Min. Mac")
+    table.add_column("Speed")
+
+    for i, m in enumerate(MODELS):
+        min_ram = int(m["min_mac"].split()[0])
+        fits = ram_gb >= min_ram if ram_gb > 0 else True
+        marker = " [green]✓[/]" if fits else " [red]✗[/]"
+        table.add_row(
+            str(i + 1),
+            m["name"],
+            m["params"],
+            m["disk"],
+            m["ram"],
+            m["min_mac"] + marker,
+            m["speed"],
+        )
+
+    console.print(table)
+
+    if ram_gb > 0:
+        console.print(f"\n  [dim]Your Mac: {ram_gb} GB RAM[/]")
+
+    console.print()
+    choice = Prompt.ask(
+        "  Choose a model",
+        choices=[str(i + 1) for i in range(len(MODELS))],
+        default="1",
+    )
+
+    model = MODELS[int(choice) - 1]
+    console.print(f"\n  Selected: [bold cyan]{model['name']}[/] ({model['disk']} download)\n")
+    return model["id"]
+
+
+def run_setup(model_path: str | None = None):
     """Run the full setup pipeline."""
     console.print()
     console.print("[bold cyan]Kandiga Setup[/]")
     console.print()
+
+    # If no model specified, show picker
+    if model_path is None or model_path == "mlx-community/Qwen3.5-35B-A3B-4bit":
+        # Check if user passed --model explicitly
+        if model_path is None:
+            model_path = _pick_model()
+        # else use the default
 
     model_name = model_path.split("/")[-1]
     model_cache_dir = os.path.join(EXPERT_CACHE_DIR, model_name)
