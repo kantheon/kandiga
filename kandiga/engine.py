@@ -77,14 +77,16 @@ def _find_layers(model: nn.Module) -> list:
 # ---------------------------------------------------------------------------
 
 class _CPUExpertLib:
-    """Thin ctypes wrapper around libkandiga_cpu_expert.dylib."""
+    """Thin ctypes wrapper around libkandiga_cpu_expert[_lg].dylib."""
 
-    def __init__(self):
+    def __init__(self, large: bool = False):
         import ctypes
 
         # Look for the dylib in the package's metal/ directory
         metal_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metal")
-        dylib_path = os.path.join(metal_dir, "libkandiga_cpu_expert.dylib")
+        dylib_name = "libkandiga_cpu_expert_lg.dylib" if large else "libkandiga_cpu_expert.dylib"
+        dylib_path = os.path.join(metal_dir, dylib_name)
+        self._large = large
 
         if not os.path.exists(dylib_path):
             raise FileNotFoundError(
@@ -131,11 +133,12 @@ class _CPUExpertLib:
         x_f16: np.ndarray,
         expert_indices: np.ndarray,
         num_experts: int,
+        hidden_size: int = 2048,
     ) -> np.ndarray:
-        """Run expert MLP on CPU with float16 I/O. Returns float16[K, 2048]."""
+        """Run expert MLP on CPU with float16 I/O."""
         import ctypes
 
-        output = np.empty((num_experts, 2048), dtype=np.float16)
+        output = np.empty((num_experts, hidden_size), dtype=np.float16)
         indices_c = np.ascontiguousarray(expert_indices.astype(np.int32))
 
         ret = self._lib.bakan_cpu_expert_mlp_f16(
@@ -209,6 +212,7 @@ class _CPUSwitchGLU(nn.Module):
                 np.ascontiguousarray(x_np[t]),
                 idx_np[t],
                 K,
+                hidden_size=self._hidden_size,
             )
             all_outputs.append(result_np)
 
@@ -307,24 +311,40 @@ class KandigaEngine:
                 f"Run 'kandiga setup' first to download and prepare the model."
             )
 
-        self._log("Loading CPU expert library")
-
-        # Step 2: Initialize CPU expert library
-        self._cpu_lib = _CPUExpertLib()
-        self._log("CPU expert library loaded")
-
-        # Step 3: Load model with lazy weights
+        # Step 2: Load model with lazy weights
         self._model, self._tokenizer = load(self.model_path, lazy=True)
         self._log("Model structure loaded (lazy)")
 
-        # Step 4: Eagerly load shared (non-expert) parameters
+        # Step 3: Detect model dimensions
+        hidden_size = 2048  # default (35B)
+        is_large = False
+        # Try model.language_model.args.hidden_size (Qwen3.5 structure)
+        lm = getattr(self._model, 'language_model', None)
+        if lm and hasattr(lm, 'args'):
+            hs = getattr(lm.args, 'hidden_size', 2048)
+            if hs != 2048:
+                hidden_size = hs
+                is_large = True
+        if not is_large and hasattr(self._model, 'args'):
+            hs = getattr(self._model.args, 'hidden_size', 2048)
+            if hs != 2048:
+                hidden_size = hs
+                is_large = True
+        if is_large:
+            self._log(f"Large model: hidden_size={hidden_size}")
+
+        # Step 4: Initialize CPU expert library (pick right dylib)
+        self._cpu_lib = _CPUExpertLib(large=is_large)
+        self._log(f"CPU expert library loaded ({'lg' if is_large else 'standard'})")
+
+        # Step 5: Eagerly load shared (non-expert) parameters
         flat = tree_flatten(self._model.parameters())
         shared = [v for k, v in flat if self.EXPERT_PATTERN not in k]
         if shared:
             mx.eval(*shared)
         self._log("Shared parameters loaded to GPU")
 
-        # Step 5: Count MoE layers and initialize CPU engine
+        # Step 6: Count MoE layers and initialize CPU engine
         layers = _find_layers(self._model)
         moe_count = sum(
             1
@@ -335,7 +355,7 @@ class KandigaEngine:
         self._cpu_engine = self._cpu_lib.init(packed_dir, moe_count)
         self._log(f"CPU engine initialized ({moe_count} MoE layers)")
 
-        # Step 6: Install CPU SwitchGLU wrappers
+        # Step 7: Install CPU SwitchGLU wrappers
         moe_idx = 0
         for layer in layers:
             mlp = layer.mlp if hasattr(layer, "mlp") else None
@@ -345,6 +365,7 @@ class KandigaEngine:
                     layer_idx=moe_idx,
                     cpu_lib=self._cpu_lib,
                     cpu_engine=self._cpu_engine,
+                    hidden_size=hidden_size,
                 )
                 mlp.switch_mlp = wrapper
                 moe_idx += 1

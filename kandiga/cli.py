@@ -93,9 +93,16 @@ def main():
     if not has_subcommand and len(sys.argv) > 1 and not all(a.startswith("-") for a in sys.argv[1:]):
         # One-shot mode: treat non-flag args as prompt
         fast = "--fast" in sys.argv
-        prompt_words = [a for a in sys.argv[1:] if not a.startswith("-")]
+        model = None
+        argv = sys.argv[1:]
+        if "--model" in argv:
+            idx = argv.index("--model")
+            if idx + 1 < len(argv):
+                model = argv[idx + 1]
+                argv = argv[:idx] + argv[idx+2:]
+        prompt_words = [a for a in argv if not a.startswith("-")]
         args = argparse.Namespace(
-            command=None, version=False, fast=fast, prompt=prompt_words
+            command=None, version=False, fast=fast, prompt=prompt_words, model=model
         )
     else:
         parser.add_argument(
@@ -148,11 +155,13 @@ def main():
         if args.prompt:
             from kandiga.chat import one_shot
 
-            one_shot(" ".join(args.prompt), fast=args.fast)
+            model = getattr(args, 'model', None)
+            one_shot(" ".join(args.prompt), fast=args.fast, model=model)
         else:
             from kandiga.chat import run_chat
 
-            run_chat(fast=args.fast)
+            model = getattr(args, 'model', None)
+            run_chat(fast=args.fast, model=model)
 
 
 if __name__ == "__main__":
