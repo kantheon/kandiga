@@ -322,48 +322,40 @@ class _CPUSwitchGLU(nn.Module):
         # FAST PREFILL: reduce expert computation during multi-token prefill.
         # Large models (122B+): skip all routed experts (shared expert sufficient).
         # Small models (35B): run experts on every 8th token only (8x faster).
-        if num_tokens > 1:
-            if self._hidden_size > 2048:
-                # Large model: skip entirely
-                target_shape = list(original_shape) + [self._hidden_size]
-                return mx.zeros(target_shape, dtype=x.dtype)
-            elif num_tokens > 4:
-                # Small model: compute experts for every 4th token + last
-                # 4x fewer expert calls while preserving document understanding.
-                x_flat = x.reshape(-1, self._hidden_size)
-                idx_flat = indices.reshape(-1, K).astype(mx.int32)
-                is_bf16 = x_flat.dtype == mx.bfloat16
+        if num_tokens > 4:
+            # FAST PREFILL: compute experts for every 4th token + last.
+            # 4x fewer expert calls. Works for both 35B and 122B.
+            x_flat = x.reshape(-1, self._hidden_size)
+            idx_flat = indices.reshape(-1, K).astype(mx.int32)
+            is_bf16 = x_flat.dtype == mx.bfloat16
 
-                if is_bf16:
-                    x_view = x_flat.view(mx.uint16)
-                    mx.eval(x_view, idx_flat)
-                else:
-                    x_flat = x_flat.astype(mx.float16)
-                    mx.eval(x_flat, idx_flat)
-                    x_view = x_flat
+            if is_bf16:
+                x_view = x_flat.view(mx.uint16)
+                mx.eval(x_view, idx_flat)
+            else:
+                x_flat = x_flat.astype(mx.float16)
+                mx.eval(x_flat, idx_flat)
+                x_view = x_flat
 
-                x_np = np.array(x_view, copy=False)
-                idx_np = np.array(idx_flat, copy=False).astype(np.int32)
-                out_np = np.zeros((num_tokens, K, self._hidden_size), dtype=np.float16)
+            x_np = np.array(x_view, copy=False)
+            idx_np = np.array(idx_flat, copy=False).astype(np.int32)
+            out_np = np.zeros((num_tokens, K, self._hidden_size), dtype=np.float16)
 
-                # Sample every 4th token + always the last
-                sample = list(range(0, num_tokens, 4))
-                if (num_tokens - 1) not in sample:
-                    sample.append(num_tokens - 1)
+            sample = list(range(0, num_tokens, 4))
+            if (num_tokens - 1) not in sample:
+                sample.append(num_tokens - 1)
 
-                mlp_func = self._cpu_lib.expert_mlp_bf16 if is_bf16 else self._cpu_lib.expert_mlp_f16
-                for si in sample:
-                    out_np[si] = mlp_func(
-                        self._cpu_engine, self._layer_idx,
-                        np.ascontiguousarray(x_np[si]), idx_np[si], K,
-                        hidden_size=self._hidden_size,
-                    )
+            mlp_func = self._cpu_lib.expert_mlp_bf16 if is_bf16 else self._cpu_lib.expert_mlp_f16
+            for si in sample:
+                out_np[si] = mlp_func(
+                    self._cpu_engine, self._layer_idx,
+                    np.ascontiguousarray(x_np[si]), idx_np[si], K,
+                    hidden_size=self._hidden_size,
+                )
 
-                result = mx.array(out_np)
-                target_shape = list(original_shape) + [self._hidden_size]
-                return result.reshape(target_shape)
+            result = mx.array(out_np)
             target_shape = list(original_shape) + [self._hidden_size]
-            return mx.zeros(target_shape, dtype=x.dtype)
+            return result.reshape(target_shape)
 
         # === EXPERT COMPUTE PATH ===
 
