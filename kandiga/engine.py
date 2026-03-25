@@ -309,48 +309,46 @@ class _CPUSwitchGLU(nn.Module):
         _prefetch_state["thread"] = t
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
-        """Forward pass: expert MLP computed on CPU."""
+        """Forward pass: expert MLP computed on CPU.
+
+        Single mx.eval sync point per layer (minimizes GPU stall time).
+        """
         original_shape = indices.shape
         K = indices.shape[-1]
 
+        # Single sync point: reshape + cast + eval in one shot
         x_flat = x.reshape(-1, self._hidden_size)
         idx_i32 = indices.reshape(-1, K).astype(mx.int32)
-        mx.eval(x_flat, idx_i32)
-
-        # Track speculation accuracy
-        actual = set(idx_i32.tolist()[0] if idx_i32.ndim > 1 else idx_i32.tolist())
-        predicted = _prefetch_state["predicted"].get(self._layer_idx, [])
-        if predicted:
-            hits = len(actual & set(predicted))
-            _prefetch_state["hits"] += hits
-            _prefetch_state["misses"] += len(actual) - hits
-
-        # Use bfloat16 path if available
         is_bf16 = x_flat.dtype == mx.bfloat16
-        if not is_bf16:
-            x_flat = x_flat.astype(mx.float16)
-            mx.eval(x_flat)
 
-        x_np = np.array(x_flat.view(mx.uint16) if is_bf16 else x_flat, copy=False)
+        if is_bf16:
+            # View as uint16 for numpy transfer (same bits, no conversion)
+            x_view = x_flat.view(mx.uint16)
+            mx.eval(x_view, idx_i32)  # SINGLE sync
+        else:
+            x_f16 = x_flat.astype(mx.float16)
+            mx.eval(x_f16, idx_i32)  # SINGLE sync
+            x_view = x_f16
+
+        # Track speculation accuracy (cheap — no sync needed)
         idx_np = np.array(idx_i32, copy=False).astype(np.int32)
+        predicted = _prefetch_state["predicted"].get(self._layer_idx)
+        if predicted:
+            actual = set(idx_np[0].tolist()) if idx_np.ndim > 1 else set(idx_np.tolist())
+            _prefetch_state["hits"] += len(actual & set(predicted))
+            _prefetch_state["misses"] += len(actual - set(predicted))
 
+        x_np = np.array(x_view, copy=False)
         num_tokens = x_np.shape[0]
         out_np = np.empty((num_tokens, K, self._hidden_size), dtype=np.float16)
 
+        mlp_func = self._cpu_lib.expert_mlp_bf16 if is_bf16 else self._cpu_lib.expert_mlp_f16
         for t in range(num_tokens):
-            if is_bf16:
-                result_t = self._cpu_lib.expert_mlp_bf16(
-                    self._cpu_engine, self._layer_idx,
-                    np.ascontiguousarray(x_np[t]), idx_np[t], K,
-                    hidden_size=self._hidden_size,
-                )
-            else:
-                result_t = self._cpu_lib.expert_mlp_f16(
-                    self._cpu_engine, self._layer_idx,
-                    np.ascontiguousarray(x_np[t]), idx_np[t], K,
-                    hidden_size=self._hidden_size,
-                )
-            out_np[t] = result_t
+            out_np[t] = mlp_func(
+                self._cpu_engine, self._layer_idx,
+                np.ascontiguousarray(x_np[t]), idx_np[t], K,
+                hidden_size=self._hidden_size,
+            )
 
         # Fire-and-forget: predict + prefetch next layer's experts
         self._predict_and_prefetch(x_np)
