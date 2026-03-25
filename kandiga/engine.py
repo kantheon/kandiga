@@ -476,13 +476,18 @@ class KandigaEngine:
             mx.eval(*shared)
         self._log("Shared parameters loaded to GPU")
 
-        # Step 5b: Apply ZMLX fused kernels (deltanet, norms, softmax)
+        # Step 5b: Apply ZMLX fused kernels — explicitly enable deltanet + norms
         try:
             from zmlx.patch import patch as zmlx_patch
-            zmlx_patch(self._model)
-            self._log("ZMLX fused kernels applied")
+            # Force-enable deltanet (GatedDeltaNet attention) + norms + softmax
+            # Skip moe_mlp and swiglu_mlp (we handle experts on CPU)
+            zmlx_patch(
+                self._model,
+                patterns=["deltanet", "rmsnorm", "softmax"],
+            )
+            self._log("ZMLX fused kernels: deltanet + rmsnorm + softmax")
         except ImportError:
-            self._log("ZMLX not installed (pip install zmlx for +15% speed)")
+            self._log("ZMLX not installed (pip install zmlx for faster attention)")
         except Exception as e:
             self._log(f"ZMLX patch failed: {e}")
 
