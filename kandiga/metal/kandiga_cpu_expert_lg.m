@@ -37,6 +37,9 @@ typedef struct {
     char*   expert_bufs[MAX_EXPERTS];
     float*  scratch_bufs[MAX_EXPERTS];
 
+    float*  x_f32_buf;        /* pre-allocated: hidden_size floats */
+    float*  out_f32_buf;      /* pre-allocated: MAX_EXPERTS * hidden_size floats */
+
     int     num_experts_total;
     size_t  expert_size;
     int     hidden_size;
@@ -187,6 +190,13 @@ void* bakan_cpu_expert_init(const char* dir, int nl) {
         e->scratch_bufs[i]=(float*)calloc(3*(size_t)e->expert_dim,sizeof(float));
         if(!e->expert_bufs[i]||!e->scratch_bufs[i]){bakan_cpu_expert_destroy(e);return NULL;}
     }
+    /* Pre-allocate f16 conversion buffers (zero malloc in hot path) */
+    e->x_f32_buf = (float*)calloc(e->hidden_size, sizeof(float));
+    e->out_f32_buf = (float*)calloc(MAX_EXPERTS * (size_t)e->hidden_size, sizeof(float));
+    if (!e->x_f32_buf || !e->out_f32_buf) {
+        bakan_cpu_expert_destroy(e); return NULL;
+    }
+
     fprintf(stderr,"[kandiga-lg] Ready: %d layers, h=%d, e=%d, %zuKB/expert\n",
             nl,e->hidden_size,e->expert_dim,e->expert_size/1024);
     return e;
@@ -249,34 +259,28 @@ int bakan_cpu_expert_mlp(void* ptr, int li, const float* x,
     return 0;
 }
 
-/* f16 */
+/* f16 — uses pre-allocated buffers, zero malloc */
 int bakan_cpu_expert_mlp_f16(void* ptr, int li, const void* xf16,
                               const int32_t* idx, int K, void* of16) {
     Engine* e=(Engine*)ptr; if(!e) return -1;
     int h=e->hidden_size;
-    float* xf=(float*)malloc(sizeof(float)*h);
-    float* of=(float*)malloc(sizeof(float)*K*h);
-    if(!xf||!of){free(xf);free(of);return -1;}
     const uint16_t* xh=(const uint16_t*)xf16;
-    for(int i=0;i<h;i++) xf[i]=f16_to_f32(xh[i]);
-    int r=bakan_cpu_expert_mlp(ptr,li,xf,idx,K,of);
-    if(r==0){uint16_t* oh=(uint16_t*)of16; for(int i=0;i<K*h;i++) oh[i]=f32_to_f16(of[i]);}
-    free(xf);free(of);return r;
+    for(int i=0;i<h;i++) e->x_f32_buf[i]=f16_to_f32(xh[i]);
+    int r=bakan_cpu_expert_mlp(ptr,li,e->x_f32_buf,idx,K,e->out_f32_buf);
+    if(r==0){uint16_t* oh=(uint16_t*)of16; int n=K*h; for(int i=0;i<n;i++) oh[i]=f32_to_f16(e->out_f32_buf[i]);}
+    return r;
 }
 
-/* bf16 */
+/* bf16 — uses pre-allocated buffers, zero malloc */
 int bakan_cpu_expert_mlp_bf16(void* ptr, int li, const void* xbf,
                                const int32_t* idx, int K, void* of16) {
     Engine* e=(Engine*)ptr; if(!e) return -1;
     int h=e->hidden_size;
-    float* xf=(float*)malloc(sizeof(float)*h);
-    float* of=(float*)malloc(sizeof(float)*K*h);
-    if(!xf||!of){free(xf);free(of);return -1;}
     const uint16_t* xr=(const uint16_t*)xbf;
-    for(int i=0;i<h;i++) xf[i]=bf16_to_f32(xr[i]);
-    int r=bakan_cpu_expert_mlp(ptr,li,xf,idx,K,of);
-    if(r==0){uint16_t* oh=(uint16_t*)of16; for(int i=0;i<K*h;i++) oh[i]=f32_to_f16(of[i]);}
-    free(xf);free(of);return r;
+    for(int i=0;i<h;i++) e->x_f32_buf[i]=bf16_to_f32(xr[i]);
+    int r=bakan_cpu_expert_mlp(ptr,li,e->x_f32_buf,idx,K,e->out_f32_buf);
+    if(r==0){uint16_t* oh=(uint16_t*)of16; int n=K*h; for(int i=0;i<n;i++) oh[i]=f32_to_f16(e->out_f32_buf[i]);}
+    return r;
 }
 
 /* destroy */
@@ -285,6 +289,7 @@ void bakan_cpu_expert_destroy(void* ptr) {
     Engine* e=(Engine*)ptr;
     if(e->layer_fds){for(int i=0;i<e->num_layers;i++) if(e->layer_fds[i]>=0) close(e->layer_fds[i]); free(e->layer_fds);}
     for(int i=0;i<MAX_EXPERTS;i++){free(e->expert_bufs[i]);free(e->scratch_bufs[i]);}
+    free(e->x_f32_buf); free(e->out_f32_buf);
     free(e); fprintf(stderr,"[kandiga-lg] Destroyed\n");
 }
 

@@ -111,6 +111,13 @@ class _CPUExpertLib:
         ]
         self._lib.bakan_cpu_expert_mlp_f16.restype = ctypes.c_int
 
+        # bakan_cpu_expert_mlp_bf16
+        self._lib.bakan_cpu_expert_mlp_bf16.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int32), ctypes.c_int, ctypes.c_void_p,
+        ]
+        self._lib.bakan_cpu_expert_mlp_bf16.restype = ctypes.c_int
+
         # bakan_cpu_expert_destroy(engine)
         self._lib.bakan_cpu_expert_destroy.argtypes = [ctypes.c_void_p]
         self._lib.bakan_cpu_expert_destroy.restype = None
@@ -151,6 +158,25 @@ class _CPUExpertLib:
         )
         if ret != 0:
             raise RuntimeError(f"CPU expert MLP failed for layer {layer_idx}")
+        return output
+
+    def expert_mlp_bf16(
+        self, engine, layer_idx: int, x_bf16: np.ndarray,
+        expert_indices: np.ndarray, num_experts: int, hidden_size: int = 2048,
+    ) -> np.ndarray:
+        """Run expert MLP with bfloat16 input. Returns float16 output."""
+        import ctypes
+        output = np.empty((num_experts, hidden_size), dtype=np.float16)
+        indices_c = np.ascontiguousarray(expert_indices.astype(np.int32))
+        ret = self._lib.bakan_cpu_expert_mlp_bf16(
+            engine, layer_idx,
+            x_bf16.ctypes.data_as(ctypes.c_void_p),
+            indices_c.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            num_experts,
+            output.ctypes.data_as(ctypes.c_void_p),
+        )
+        if ret != 0:
+            raise RuntimeError(f"CPU expert MLP (bf16) failed for layer {layer_idx}")
         return output
 
     def destroy(self, engine):
@@ -196,32 +222,38 @@ class _CPUSwitchGLU(nn.Module):
         original_shape = indices.shape
         K = indices.shape[-1]
 
-        x_f16 = x.reshape(-1, self._hidden_size).astype(mx.float16)
+        x_flat = x.reshape(-1, self._hidden_size)
         idx_i32 = indices.reshape(-1, K).astype(mx.int32)
-        mx.eval(x_f16, idx_i32)
+        mx.eval(x_flat, idx_i32)
 
-        x_np = np.array(x_f16, copy=False)
+        # Use bfloat16 path if available (avoids extra astype)
+        is_bf16 = x_flat.dtype == mx.bfloat16
+        if not is_bf16:
+            x_flat = x_flat.astype(mx.float16)
+            mx.eval(x_flat)
+
+        x_np = np.array(x_flat.view(mx.uint16) if is_bf16 else x_flat, copy=False)
         idx_np = np.array(idx_i32, copy=False).astype(np.int32)
 
         num_tokens = x_np.shape[0]
-        all_outputs = []
+        out_np = np.empty((num_tokens, K, self._hidden_size), dtype=np.float16)
+
         for t in range(num_tokens):
-            result_np = self._cpu_lib.expert_mlp_f16(
-                self._cpu_engine,
-                self._layer_idx,
-                np.ascontiguousarray(x_np[t]),
-                idx_np[t],
-                K,
-                hidden_size=self._hidden_size,
-            )
-            all_outputs.append(result_np)
+            if is_bf16 and hasattr(self._cpu_lib, '_lib') and hasattr(self._cpu_lib._lib, 'bakan_cpu_expert_mlp_bf16'):
+                result_t = self._cpu_lib.expert_mlp_bf16(
+                    self._cpu_engine, self._layer_idx,
+                    np.ascontiguousarray(x_np[t]), idx_np[t], K,
+                    hidden_size=self._hidden_size,
+                )
+            else:
+                result_t = self._cpu_lib.expert_mlp_f16(
+                    self._cpu_engine, self._layer_idx,
+                    np.ascontiguousarray(x_np[t]), idx_np[t], K,
+                    hidden_size=self._hidden_size,
+                )
+            out_np[t] = result_t
 
-        if num_tokens == 1:
-            result_np = all_outputs[0]
-        else:
-            result_np = np.stack(all_outputs, axis=0)
-
-        result = mx.array(result_np)
+        result = mx.array(out_np.reshape(-1, K, self._hidden_size))
         target_shape = list(original_shape) + [self._hidden_size]
         return result.reshape(target_shape)
 
