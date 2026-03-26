@@ -757,13 +757,18 @@ class KandigaEngine:
         # Step 1: Verify packed binary files exist
         cache_dir = self._model_cache_dir()
         packed_dir = os.path.join(cache_dir, "packed")
-        if not os.path.isdir(packed_dir):
-            raise FileNotFoundError(
-                f"Packed expert files not found at {packed_dir}.\n"
-                f"Run 'kandiga setup' first to download and prepare the model."
-            )
+        is_dense = not os.path.isdir(packed_dir)
 
-        # Step 2: Load model with lazy weights
+        if is_dense:
+            # Dense model (non-MoE) — load all weights, skip SEM
+            self._model, self._tokenizer = load(self.model_path)
+            self._log("Dense model loaded (all weights in memory)")
+            self._cpu_lib = None
+            self._cpu_engine = None
+            self._ready = True
+            return
+
+        # Step 2: Load model with lazy weights (MoE path — unchanged)
         self._model, self._tokenizer = load(self.model_path, lazy=True)
         self._log("Model structure loaded (lazy)")
 

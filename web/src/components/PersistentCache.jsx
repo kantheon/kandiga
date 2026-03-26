@@ -22,10 +22,10 @@ export default function PersistentCache() {
               { turn: 'Turn 10', time: '50s', tokens: '1500 tokens' },
               { turn: 'Turn 30', time: '2min+', tokens: '5000 tokens' },
             ].map((r, i) => (
-              <div key={i} className="flex justify-between text-[var(--text-muted)]">
+              <div key={i} className="grid grid-cols-[1fr_60px_100px] text-[var(--text-muted)]">
                 <span>{r.turn}</span>
-                <span className="text-red-400/80">{r.time}</span>
-                <span className="text-[11px]">{r.tokens}</span>
+                <span className="text-red-400/80 text-right">{r.time}</span>
+                <span className="text-[11px] text-right">{r.tokens}</span>
               </div>
             ))}
           </div>
@@ -37,15 +37,15 @@ export default function PersistentCache() {
           <div className="text-sm font-semibold text-[var(--cyan)] mb-3">With persistent KV cache</div>
           <div className="space-y-2 font-mono text-xs">
             {[
-              { turn: 'Turn 1', time: '8s', tokens: '100 tokens', note: '(first read)' },
+              { turn: 'Turn 1', time: '8s', tokens: '100 tokens' },
               { turn: 'Turn 5', time: '3s', tokens: '20 new tokens' },
               { turn: 'Turn 10', time: '3s', tokens: '25 new tokens' },
               { turn: 'Turn 30', time: '3s', tokens: '20 new tokens' },
             ].map((r, i) => (
-              <div key={i} className="flex justify-between text-[var(--text-muted)]">
+              <div key={i} className="grid grid-cols-[1fr_60px_100px] text-[var(--text-muted)]">
                 <span>{r.turn}</span>
-                <span className="text-[var(--cyan)] font-medium">{r.time}</span>
-                <span className="text-[11px]">{r.tokens}</span>
+                <span className="text-[var(--cyan)] font-medium text-right">{r.time}</span>
+                <span className="text-[11px] text-right">{r.tokens}</span>
               </div>
             ))}
           </div>
