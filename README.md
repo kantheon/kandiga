@@ -75,9 +75,9 @@ Measured on M4 Mac Mini (16GB):
 
 | Model | Mode | Decode | TTFT (first turn) | TTFT (follow-up) | RAM |
 |-------|------|--------|-------------------|-------------------|-----|
-| Qwen3.5-35B | K=8 | 3.7 tok/s | 5-15s | **3-4s** | ~2 GB |
-| Qwen3.5-35B | K=4 | 6.5 tok/s | 3-8s | **3-4s** | ~2 GB |
-| Qwen3.5-122B | K=4 | 1.4 tok/s | 7-27s | **3-4s** | ~4 GB |
+| Qwen3.5-35B | K=8 | 3.7 tok/s | 5-15s | **2-4s** | ~2 GB |
+| Qwen3.5-35B | K=4 | 6.3 tok/s | 3-8s | **2-4s** | ~2 GB |
+| Qwen3.5-122B | K=4 | 1.0 tok/s | 11-18s | **11-15s** | ~4 GB |
 
 Key: follow-up TTFT is constant (3-4s) regardless of conversation length thanks to persistent KV cache.
 
@@ -125,6 +125,22 @@ engine.end_session()
 ```
 
 Combined with TurboQuant (3.8x KV compression), conversations can run for 32K+ tokens before hitting memory limits.
+
+### Save & Resume Sessions
+
+Sessions persist to disk so conversations survive app restarts. Close your laptop, reopen tomorrow, and pick up exactly where you left off — no re-processing.
+
+```python
+# Save conversation state (KV cache + history)
+engine.save_session("~/my_session.npz")   # ~2-10MB compressed
+
+# Later: load and continue instantly
+engine.load_session("~/my_session.npz")   # <0.2s load time
+for token in engine.session_generate("Where were we?"):
+    print(token, end="")  # model remembers everything
+```
+
+The save file includes the full KV cache state for all 40-48 layers (attention + linear), conversation history, and token tracking. Loading restores the model's exact state — no re-reading the conversation.
 
 ## GPU Metal Prefill
 

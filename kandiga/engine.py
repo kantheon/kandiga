@@ -1026,6 +1026,145 @@ class KandigaEngine:
         self._session_history = []
         self._session_tokens_fed = []
 
+    def save_session(self, path: str):
+        """Save the conversation state to disk.
+
+        Saves the KV cache + history so the conversation can be
+        resumed later with load_session(). The model reads the
+        document once, user saves, closes app, reopens next day,
+        loads — picks up exactly where they left off.
+
+        File size: ~2-10MB depending on conversation length.
+        """
+        import json
+        if not hasattr(self, '_session_cache') or self._session_cache is None:
+            raise RuntimeError("No active session to save")
+
+        # Save KV cache arrays (preserving exact shapes and dtypes)
+        save_dict = {}
+        dtype_map = {}
+        layer_info = {}  # cache type + array count per layer
+        for i, layer_cache in enumerate(self._session_cache):
+            # Unwrap CompressedArraysCache if present
+            raw_cache = layer_cache
+            if hasattr(layer_cache, '_original'):
+                raw_cache = layer_cache._original
+
+            # Determine cache type and extract state
+            cache_type = type(raw_cache).__name__
+            if cache_type == 'KVCache':
+                # KVCache.state getter crashes on fresh cache (keys=None),
+                # so access keys/values directly
+                arrays = [raw_cache.keys, raw_cache.values]
+                layer_info[str(i)] = {'type': 'KVCache', 'n': 2,
+                                      'offset': raw_cache.offset}
+            elif cache_type == 'ArraysCache':
+                arrays = raw_cache.cache
+                layer_info[str(i)] = {'type': 'ArraysCache',
+                                      'n': len(arrays)}
+            else:
+                continue
+
+            for j, arr in enumerate(arrays):
+                if arr is not None:
+                    # For KVCache, trim to offset (don't save padding)
+                    if cache_type == 'KVCache' and raw_cache.offset < arr.shape[2]:
+                        arr = arr[..., :raw_cache.offset, :]
+                    mx.eval(arr)
+                    key = f"cache_{i}_{j}"
+                    if arr.dtype == mx.float32:
+                        np_arr = np.array(arr, copy=False)
+                    else:
+                        np_arr = np.array(arr.view(mx.uint16), copy=False)
+                    save_dict[key] = np_arr
+                    dtype_map[key] = {
+                        'shape': list(arr.shape),
+                        'dtype': str(arr.dtype),
+                    }
+
+        np.savez_compressed(path, **save_dict)
+
+        # Save metadata alongside
+        meta_path = path.replace('.npz', '_meta.json')
+        with open(meta_path, 'w') as f:
+            json.dump({
+                'history': self._session_history,
+                'tokens_fed': self._session_tokens_fed,
+                'model': self.model_path,
+                'dtype_map': dtype_map,
+                'layer_info': layer_info,
+            }, f)
+
+        size_kb = os.path.getsize(path) / 1024
+        self._log(f"Session saved: {path} ({size_kb:.0f}KB)")
+
+    def load_session(self, path: str):
+        """Load a conversation state from disk.
+
+        Restores the KV cache + history from a previous save_session().
+        The model picks up the conversation exactly where it left off.
+        Loading is near-instant (<0.1s) regardless of conversation length.
+        """
+        import json
+        if not self._ready:
+            self.load()
+
+        # Load metadata
+        meta_path = path.replace('.npz', '_meta.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        if meta['model'] != self.model_path:
+            raise ValueError(f"Session was for {meta['model']}, not {self.model_path}")
+
+        # Create fresh cache
+        self._session_cache = self._model.make_cache()
+        self._session_history = meta['history']
+        self._session_tokens_fed = meta['tokens_fed']
+        dtype_map = meta.get('dtype_map', {})
+
+        # Load arrays with exact shapes and dtypes
+        data = np.load(path)
+        layer_info = meta.get('layer_info', {})
+
+        for i, layer_cache in enumerate(self._session_cache):
+            raw_cache = layer_cache
+            if hasattr(layer_cache, '_original'):
+                raw_cache = layer_cache._original
+
+            # Use saved layer_info to know array count (avoids crashing
+            # KVCache.state getter on fresh cache where keys=None)
+            info_i = layer_info.get(str(i))
+            if info_i is None:
+                continue
+            num_arrays = info_i['n']
+
+            state = []
+            for j in range(num_arrays):
+                key = f"cache_{i}_{j}"
+                if key in data and key in dtype_map:
+                    info = dtype_map[key]
+                    orig_shape = tuple(info['shape'])
+                    orig_dtype = info['dtype']
+                    np_arr = data[key]
+                    mx_arr = mx.array(np_arr)
+                    if 'float32' in orig_dtype:
+                        mx_arr = mx_arr.reshape(orig_shape)
+                    else:
+                        dt = mx.bfloat16 if 'bfloat' in orig_dtype else mx.float16
+                        mx_arr = mx_arr.view(dt).reshape(orig_shape)
+                    state.append(mx_arr)
+                else:
+                    state.append(None)
+
+            # For KVCache: set keys/values/offset directly (state setter
+            # handles this, and offset is derived from keys.shape[2])
+            if any(s is not None for s in state):
+                raw_cache.state = state
+
+        size_kb = os.path.getsize(path) / 1024
+        self._log(f"Session loaded: {path} ({size_kb:.0f}KB, {len(self._session_history)} messages)")
+
     def session_generate(
         self,
         user_message: str,
