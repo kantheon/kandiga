@@ -1,6 +1,6 @@
 [project]
 name = "kandiga"
-version = "0.7.0"
+version = "0.7.1"
 description = "Run 35B-397B MoE models in 2-8GB RAM. Custom Metal GPU kernels. Any Mac."
 readme = "README.md"
 requires-python = ">=3.9"
