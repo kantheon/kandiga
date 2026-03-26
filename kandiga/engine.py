@@ -296,135 +296,93 @@ class _CPUSwitchGLU(nn.Module):
                 pass
 
     def _gpu_prefill_experts(self, x_flat, idx_i32, num_tokens, K, out_np):
-        """Prefill: GPU batched expert MLP via MLX dequantize + matmul.
+        """Prefill: GPU batched expert MLP. One pread + one GPU matmul per expert.
 
-        For each unique expert:
-        1. pread expert weights from disk (one read per expert)
-        2. Parse into MLX arrays (gate/up/down weight+scales+biases)
-        3. Dequantize on GPU
-        4. Batched matmul: weight @ all_tokens_for_this_expert
-        5. SwiGLU activation
-        6. Down projection
-        7. Scatter results back to token positions
-
-        43x faster than CPU sequential for 363 tokens.
+        43x faster than CPU sequential. Groups tokens by expert,
+        preads each expert once, GPU batched dequant+matmul.
         """
-        idx_np = np.array(idx_i32, copy=False).astype(np.int32)
-
-        # Group tokens by expert
-        from collections import defaultdict
-        expert_groups = defaultdict(list)  # eidx -> [(token_idx, k_pos)]
-        for t in range(num_tokens):
-            for k in range(K):
-                eidx = int(idx_np[t, k])
-                expert_groups[eidx].append((t, k))
-
-        # Expert tensor layout (35B: hidden=2048, expert_dim=512, group_size=64)
-        # gate_proj: weight(512, 256)u32, scales(512, 32)bf16, biases(512, 32)bf16
-        # up_proj: same
-        # down_proj: weight(2048, 64)u32, scales(2048, 8)bf16, biases(2048, 8)bf16
         h = self._hidden_size
-        packed_h = h // 8  # packed uint32 columns
-        gs = 64  # group_size
-        groups_h = h // gs
-
-        if h == 2048:
-            edim = 512
-            packed_edim = edim // 8
-            groups_edim = edim // gs
-            # Byte offsets from the C defines
-            offsets = {
-                'gate_w': (0, edim, packed_h, np.uint32),
-                'gate_s': (524288, edim, groups_h, np.uint16),
-                'gate_b': (557056, edim, groups_h, np.uint16),
-                'up_w': (589824, edim, packed_h, np.uint32),
-                'up_s': (1114112, edim, groups_h, np.uint16),
-                'up_b': (1146880, edim, groups_h, np.uint16),
-                'down_w': (1179648, h, packed_edim, np.uint32),
-                'down_s': (1703936, h, groups_edim, np.uint16),
-                'down_b': (1736704, h, groups_edim, np.uint16),
-            }
-        else:
-            # Fallback to CPU for non-35B
+        if h != 2048:
+            # Non-35B: fallback to CPU
             mlp_func = self._cpu_lib.expert_mlp_f16
-            x_np = np.array(x_flat.astype(mx.float16), copy=False)
+            x_np_raw = np.array(x_flat.astype(mx.float16), copy=False)
             mx.eval(x_flat)
+            idx_np = np.array(idx_i32, copy=False).astype(np.int32)
             for t in range(num_tokens):
                 out_np[t] = mlp_func(self._cpu_engine, self._layer_idx,
-                    np.ascontiguousarray(x_np[t]), idx_np[t], K, hidden_size=h)
+                    np.ascontiguousarray(x_np_raw[t]), idx_np[t], K, hidden_size=h)
             return
 
-        # Open layer file
+        idx_np = np.array(idx_i32, copy=False).astype(np.int32)
+        gs = 64
+        esz = self._expert_size
+
+        # Vectorized grouping using numpy (no Python dicts)
+        flat_tok = np.repeat(np.arange(num_tokens, dtype=np.int32), K)
+        flat_k = np.tile(np.arange(K, dtype=np.int32), num_tokens)
+        flat_exp = idx_np.reshape(-1)
+        sort_idx = np.argsort(flat_exp, kind='mergesort')
+        s_tok = flat_tok[sort_idx]
+        s_k = flat_k[sort_idx]
+        s_exp = flat_exp[sort_idx]
+
+        # Find group boundaries
+        changes = np.concatenate([[0], np.where(np.diff(s_exp))[0] + 1, [len(s_exp)]])
+        unique_experts = s_exp[changes[:-1]]
+
+        # Open file, get x on GPU
         layer_path = os.path.join(self._packed_dir, f"layer_{self._layer_idx:02d}.bin")
-        try:
-            fd = os.open(layer_path, os.O_RDONLY)
-        except OSError:
-            # Fallback
-            mlp_func = self._cpu_lib.expert_mlp_f16
-            x_np = np.array(x_flat.astype(mx.float16), copy=False)
-            for t in range(num_tokens):
-                out_np[t] = mlp_func(self._cpu_engine, self._layer_idx,
-                    np.ascontiguousarray(x_np[t]), idx_np[t], K, hidden_size=h)
-            return
-
-        # Ensure x is evaluated and on GPU
+        fd = os.open(layer_path, os.O_RDONLY)
         x_gpu = x_flat.astype(mx.float16)
         mx.eval(x_gpu)
 
-        # Process each unique expert on GPU
-        result_parts = {}  # (token_idx, k_pos) -> mx.array[hidden]
-        for eidx, assignments in expert_groups.items():
-            # pread expert data
-            offset = 4096 + eidx * self._expert_size
-            raw = os.pread(fd, self._expert_size, offset)
+        # Expert tensor offsets (35B)
+        OFS = [(0, 512, 256, np.uint32), (524288, 512, 32, np.uint16), (557056, 512, 32, np.uint16),
+               (589824, 512, 256, np.uint32), (1114112, 512, 32, np.uint16), (1146880, 512, 32, np.uint16),
+               (1179648, 2048, 64, np.uint32), (1703936, 2048, 8, np.uint16), (1736704, 2048, 8, np.uint16)]
 
-            # Parse weights into numpy then MLX
-            def load_tensor(off, rows, cols, dtype):
-                itemsize = 4 if dtype == np.uint32 else 2
-                nbytes = rows * cols * itemsize
-                arr = np.frombuffer(raw, dtype=dtype, count=rows*cols, offset=off).reshape(rows, cols)
-                return mx.array(arr)
+        lazy_results = []
+        scatter_info = []
 
-            gate_w = load_tensor(*offsets['gate_w'])
-            gate_s = load_tensor(*offsets['gate_s'])
-            gate_b = load_tensor(*offsets['gate_b'])
-            up_w = load_tensor(*offsets['up_w'])
-            up_s = load_tensor(*offsets['up_s'])
-            up_b = load_tensor(*offsets['up_b'])
-            down_w = load_tensor(*offsets['down_w'])
-            down_s = load_tensor(*offsets['down_s'])
-            down_b = load_tensor(*offsets['down_b'])
+        for gi in range(len(unique_experts)):
+            eidx = int(unique_experts[gi])
+            start, end = int(changes[gi]), int(changes[gi + 1])
+            toks = s_tok[start:end]
+            kpos = s_k[start:end]
 
-            # Gather tokens assigned to this expert
-            token_indices = [a[0] for a in assignments]
-            x_batch = x_gpu[token_indices]  # (N, hidden)
+            # pread once
+            raw = os.pread(fd, esz, 4096 + eidx * esz)
 
-            # GPU: dequantize + batched matmul (all lazy, one eval)
-            gate_full = mx.dequantize(gate_w, gate_s.view(mx.bfloat16), gate_b.view(mx.bfloat16), group_size=gs, bits=4)
-            up_full = mx.dequantize(up_w, up_s.view(mx.bfloat16), up_b.view(mx.bfloat16), group_size=gs, bits=4)
-            down_full = mx.dequantize(down_w, down_s.view(mx.bfloat16), down_b.view(mx.bfloat16), group_size=gs, bits=4)
+            # Parse 9 tensors
+            tensors = []
+            for off, rows, cols, dt in OFS:
+                tensors.append(mx.array(np.frombuffer(raw, dtype=dt, count=rows*cols, offset=off).reshape(rows, cols)))
+            gw, gs_, gb, uw, us, ub, dw, ds, db = tensors
 
-            gate_out = x_batch @ gate_full.T
-            up_out = x_batch @ up_full.T
-            activated = (gate_out / (1 + mx.exp(-gate_out))) * up_out  # SiLU(gate) * up
-            expert_out = (activated @ down_full.T).astype(mx.float16)
-            # Don't eval yet — accumulate lazy graph
+            # Gather + GPU matmul (lazy)
+            x_batch = x_gpu[toks.tolist()]
+            g = mx.dequantize(gw, gs_.view(mx.bfloat16), gb.view(mx.bfloat16), group_size=gs, bits=4)
+            u = mx.dequantize(uw, us.view(mx.bfloat16), ub.view(mx.bfloat16), group_size=gs, bits=4)
+            d = mx.dequantize(dw, ds.view(mx.bfloat16), db.view(mx.bfloat16), group_size=gs, bits=4)
+            go = x_batch @ g.T
+            uo = x_batch @ u.T
+            act = (go / (1 + mx.exp(-go))) * uo
+            out = (act @ d.T).astype(mx.float16)
 
-            # Store lazy result for later eval
-            result_parts[eidx] = (expert_out, assignments)
+            lazy_results.append(out)
+            scatter_info.append((toks, kpos))
 
         os.close(fd)
 
-        # ONE eval for ALL experts in this layer
-        all_outputs = [v[0] for v in result_parts.values()]
-        if all_outputs:
-            mx.eval(*all_outputs)
+        # ONE eval for entire layer
+        if lazy_results:
+            mx.eval(*lazy_results)
 
-        # Scatter results
-        for eidx, (expert_out, assignments) in result_parts.items():
-            expert_out_np = np.array(expert_out, copy=False)
-            for i, (t, k) in enumerate(assignments):
-                out_np[t, k] = expert_out_np[i]
+        # Scatter
+        for out_mx, (toks, kpos) in zip(lazy_results, scatter_info):
+            out_arr = np.array(out_mx, copy=False)
+            for i in range(len(toks)):
+                out_np[toks[i], kpos[i]] = out_arr[i]
 
     def _batched_prefill_experts(self, x_view, idx_np, actual_tokens, K, out_np):
         """Prefill: one C call per layer, grouped by expert.
