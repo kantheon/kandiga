@@ -118,6 +118,15 @@ class _CPUExpertLib:
         ]
         self._lib.bakan_cpu_expert_mlp_bf16.restype = ctypes.c_int
 
+        # bakan_cpu_expert_mlp_batch_f16(engine, layer, x_batch, indices_batch,
+        #                                num_tokens, K, output_batch)
+        self._lib.bakan_cpu_expert_mlp_batch_f16.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int32), ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        self._lib.bakan_cpu_expert_mlp_batch_f16.restype = ctypes.c_int
+
         # bakan_cpu_expert_destroy(engine)
         self._lib.bakan_cpu_expert_destroy.argtypes = [ctypes.c_void_p]
         self._lib.bakan_cpu_expert_destroy.restype = None
@@ -357,7 +366,7 @@ class _CPUSwitchGLU(nn.Module):
         if num_tokens == 1:
             self._predict_and_prefetch(x_np)
 
-        # CPU expert compute for each token
+        # CPU expert compute
         mlp_func = self._cpu_lib.expert_mlp_bf16 if is_bf16 else self._cpu_lib.expert_mlp_f16
         for t in range(actual_tokens):
             out_np[t] = mlp_func(

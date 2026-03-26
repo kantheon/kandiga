@@ -349,6 +349,108 @@ int bakan_cpu_expert_mlp(
 }
 
 /* ----------------------------------------------------------------------- */
+/* bakan_cpu_expert_mlp_batch_f16 — Batched prefill: N tokens, deduplicated */
+/*                                                                          */
+/* Instead of N separate calls (each doing K preads), this:                 */
+/* 1. Collects ALL unique expert indices across N tokens                    */
+/* 2. Preads each unique expert ONCE                                        */
+/* 3. Computes all tokens using cached expert data                          */
+/*                                                                          */
+/* For 500 tokens with K=4: ~200 unique experts vs 2000 preads.            */
+/* ----------------------------------------------------------------------- */
+int bakan_cpu_expert_mlp_batch_f16(
+    void* engine_ptr,
+    int layer_idx,
+    const void* x_f16_batch,       /* float16[num_tokens][hidden_size] */
+    const int32_t* indices_batch,  /* int32[num_tokens][K] */
+    int num_tokens,
+    int K,
+    void* output_f16_batch         /* float16[num_tokens][K][hidden_size] */
+) {
+    KandigaCPUExpertEngine* engine = (KandigaCPUExpertEngine*)engine_ptr;
+    if (!engine || layer_idx < 0 || layer_idx >= engine->num_layers) return -1;
+    if (num_tokens <= 0 || K <= 0 || K > MAX_EXPERTS) return -1;
+
+    int fd = engine->layer_fds[layer_idx];
+
+    /* Step 1: Collect all unique expert indices */
+    int unique_experts[256];
+    int num_unique = 0;
+    char seen[256] = {0};
+
+    for (int t = 0; t < num_tokens; t++) {
+        for (int k = 0; k < K; k++) {
+            int eidx = indices_batch[t * K + k];
+            if (eidx >= 0 && eidx < 256 && !seen[eidx]) {
+                seen[eidx] = 1;
+                unique_experts[num_unique++] = eidx;
+            }
+        }
+    }
+
+    /* Step 2: Pread unique experts in parallel */
+    /* Use a staging area: expert_bufs[0..num_unique-1] */
+    /* Map: expert_index -> buffer_slot */
+    int expert_to_slot[256];
+    memset(expert_to_slot, -1, sizeof(expert_to_slot));
+
+    __block int pread_error = 0;
+    {
+        dispatch_group_t group = dispatch_group_create();
+        dispatch_queue_t io_queue = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+
+        for (int u = 0; u < num_unique && u < MAX_EXPERTS; u++) {
+            int eidx = unique_experts[u];
+            expert_to_slot[eidx] = u;
+            char* buf = engine->expert_bufs[u];
+            dispatch_group_async(group, io_queue, ^{
+                off_t offset = (off_t)HEADER_SIZE + (off_t)eidx * (off_t)EXPERT_SIZE;
+                ssize_t n = pread(fd, buf, EXPERT_SIZE, offset);
+                if (n != (ssize_t)EXPERT_SIZE) pread_error = 1;
+            });
+        }
+        dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+    }
+    /* Handle overflow: if more than MAX_EXPERTS unique, pread remaining */
+    for (int u = MAX_EXPERTS; u < num_unique; u++) {
+        int eidx = unique_experts[u];
+        expert_to_slot[eidx] = u % MAX_EXPERTS;
+        off_t offset = (off_t)HEADER_SIZE + (off_t)eidx * (off_t)EXPERT_SIZE;
+        pread(fd, engine->expert_bufs[u % MAX_EXPERTS], EXPERT_SIZE, offset);
+    }
+    if (pread_error) return -1;
+
+    /* Step 3: Compute all tokens using cached expert data */
+    const uint16_t* x_batch = (const uint16_t*)x_f16_batch;
+    uint16_t* out_batch = (uint16_t*)output_f16_batch;
+
+    for (int t = 0; t < num_tokens; t++) {
+        /* Convert f16 input to f32 */
+        float x_f32[HIDDEN_SIZE];
+        for (int i = 0; i < HIDDEN_SIZE; i++) {
+            x_f32[i] = half_to_float(x_batch[t * HIDDEN_SIZE + i]);
+        }
+
+        /* Compute each expert for this token */
+        float output_f32[MAX_EXPERTS * HIDDEN_SIZE];
+        for (int k = 0; k < K; k++) {
+            int eidx = indices_batch[t * K + k];
+            int slot = expert_to_slot[eidx];
+            if (slot < 0) continue;
+            const char* expert_data = engine->expert_bufs[slot];
+            compute_single_expert(expert_data, x_f32, output_f32 + k * HIDDEN_SIZE);
+        }
+
+        /* Convert f32 output to f16 */
+        for (int i = 0; i < K * HIDDEN_SIZE; i++) {
+            out_batch[t * K * HIDDEN_SIZE + i] = float_to_half(output_f32[i]);
+        }
+    }
+
+    return 0;
+}
+
+/* ----------------------------------------------------------------------- */
 /* bakan_cpu_expert_mlp_f16                                                 */
 /* ----------------------------------------------------------------------- */
 int bakan_cpu_expert_mlp_f16(
