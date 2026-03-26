@@ -224,6 +224,71 @@ _prefetch_state = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Custom Metal kernels for batched expert MLP (zero Python loop overhead)
+# ---------------------------------------------------------------------------
+_DEQUANT_HEADER = '''
+inline float dq(const device uint32_t* w, const device half* s, const device half* b,
+                const device half* x, uint row, uint hd, uint gs, uint ppr, uint gpr) {
+    float acc=0; const device uint32_t* wr=w+row*ppr;
+    const device half* sr=s+row*gpr; const device half* br=b+row*gpr;
+    for(uint g=0;g<gpr;g++){float sc=float(sr[g]),bi=float(br[g]);
+    for(uint p=0;p<gs/8;p++){uint32_t pk=wr[g*(gs/8)+p];uint xb=g*gs+p*8;
+    acc+=(float((pk    )&0xF)*sc+bi)*float(x[xb])+(float((pk>>4)&0xF)*sc+bi)*float(x[xb+1])
+        +(float((pk>> 8)&0xF)*sc+bi)*float(x[xb+2])+(float((pk>>12)&0xF)*sc+bi)*float(x[xb+3])
+        +(float((pk>>16)&0xF)*sc+bi)*float(x[xb+4])+(float((pk>>20)&0xF)*sc+bi)*float(x[xb+5])
+        +(float((pk>>24)&0xF)*sc+bi)*float(x[xb+6])+(float((pk>>28)&0xF)*sc+bi)*float(x[xb+7]);}}
+    return acc;
+}
+inline float dqf(const device uint32_t* w, const device half* s, const device half* b,
+                 const device float* x, uint row, uint ed, uint gs, uint ppr, uint gpr) {
+    float acc=0; const device uint32_t* wr=w+row*ppr;
+    const device half* sr=s+row*gpr; const device half* br=b+row*gpr;
+    for(uint g=0;g<gpr;g++){float sc=float(sr[g]),bi=float(br[g]);
+    for(uint p=0;p<gs/8;p++){uint32_t pk=wr[g*(gs/8)+p];uint xb=g*gs+p*8;
+    acc+=(float((pk    )&0xF)*sc+bi)*x[xb]+(float((pk>>4)&0xF)*sc+bi)*x[xb+1]
+        +(float((pk>> 8)&0xF)*sc+bi)*x[xb+2]+(float((pk>>12)&0xF)*sc+bi)*x[xb+3]
+        +(float((pk>>16)&0xF)*sc+bi)*x[xb+4]+(float((pk>>20)&0xF)*sc+bi)*x[xb+5]
+        +(float((pk>>24)&0xF)*sc+bi)*x[xb+6]+(float((pk>>28)&0xF)*sc+bi)*x[xb+7];}}
+    return acc;
+}
+'''
+
+_metal_phase1 = mx.fast.metal_kernel(
+    name='expert_gate_up_silu',
+    input_names=['x_input','gw','gs_','gb','uw','us_','ub','slots','tokens','dims'],
+    output_names=['activated'],
+    header=_DEQUANT_HEADER,
+    source='''
+    uint tid=thread_position_in_grid.x;
+    uint ed=dims[0],hd=dims[1],total=dims[2],gs_v=64,ppr=hd/8,gpr=hd/gs_v;
+    uint ai=tid/ed, row=tid%ed;
+    if(ai>=total||row>=ed)return;
+    uint sl=slots[ai],tk=tokens[ai];
+    const device half* xt=x_input+tk*hd;
+    float g=dq(gw+sl*ed*ppr,gs_+sl*ed*gpr,gb+sl*ed*gpr,xt,row,hd,gs_v,ppr,gpr);
+    float u=dq(uw+sl*ed*ppr,us_+sl*ed*gpr,ub+sl*ed*gpr,xt,row,hd,gs_v,ppr,gpr);
+    activated[ai*ed+row]=(g/(1.0f+exp(-g)))*u;
+    ''',
+)
+
+_metal_phase2 = mx.fast.metal_kernel(
+    name='expert_down_proj',
+    input_names=['activated','dw','ds_','db','slots','dims'],
+    output_names=['output'],
+    header=_DEQUANT_HEADER,
+    source='''
+    uint tid=thread_position_in_grid.x;
+    uint hd=dims[0],ed=dims[1],total=dims[2],gs_v=64,ppr=ed/8,gpr=ed/gs_v;
+    uint ai=tid/hd, row=tid%hd;
+    if(ai>=total||row>=hd)return;
+    uint sl=slots[ai];
+    float val=dqf(dw+sl*hd*ppr,ds_+sl*hd*gpr,db+sl*hd*gpr,activated+ai*ed,row,ed,gs_v,ppr,gpr);
+    output[ai*hd+row]=half(val);
+    ''',
+)
+
+
 @mx.compile
 def _compiled_expert_mlp(x, gw, gs, gb, uw, us, ub, dw, ds, db):
     """Compiled expert MLP: dequantize + matmul + SiLU + down. Graph reused."""
@@ -378,41 +443,60 @@ class _CPUSwitchGLU(nn.Module):
         lazy_results = []
         scatter_info = []
 
-        # Stack ALL expert tensors into 9 big arrays (9 mx.array calls, not 1800)
-        def stack_all(off, rows, cols, dt):
+        # Stack expert tensors into flat arrays for Metal kernel
+        edim = 512  # 35B expert_dim
+        def stack_flat(off, rows, cols, dt):
             isz = 4 if dt == np.uint32 else 2
-            arrs = [raw_buf[gi*esz+off:gi*esz+off+rows*cols*isz].view(dt).reshape(rows, cols) for gi in range(num_unique)]
-            return mx.array(np.stack(arrs))
+            arrs = [raw_buf[gi*esz+off:gi*esz+off+rows*cols*isz].view(dt).reshape(rows*cols) for gi in range(num_unique)]
+            return mx.array(np.concatenate(arrs))
 
-        all_gw = stack_all(*OFS[0]); all_gs = stack_all(*OFS[1]); all_gb = stack_all(*OFS[2])
-        all_uw = stack_all(*OFS[3]); all_us = stack_all(*OFS[4]); all_ub = stack_all(*OFS[5])
-        all_dw = stack_all(*OFS[6]); all_ds = stack_all(*OFS[7]); all_db = stack_all(*OFS[8])
+        # Scales/biases are bfloat16 on disk — convert to float16 for Metal kernel
+        all_gw = stack_flat(*OFS[0])
+        all_gs = stack_flat(*OFS[1]).view(mx.bfloat16).astype(mx.float16)
+        all_gb = stack_flat(*OFS[2]).view(mx.bfloat16).astype(mx.float16)
+        all_uw = stack_flat(*OFS[3])
+        all_us = stack_flat(*OFS[4]).view(mx.bfloat16).astype(mx.float16)
+        all_ub = stack_flat(*OFS[5]).view(mx.bfloat16).astype(mx.float16)
+        all_dw = stack_flat(*OFS[6])
+        all_ds = stack_flat(*OFS[7]).view(mx.bfloat16).astype(mx.float16)
+        all_db = stack_flat(*OFS[8]).view(mx.bfloat16).astype(mx.float16)
 
-        # GPU matmul per expert (from stacked — just slice, no new mx.array)
-        for gi in range(num_unique):
-            start, end = int(changes[gi]), int(changes[gi + 1])
-            toks = s_tok[start:end]
-            kpos = s_k[start:end]
+        # Build assignment arrays: map each (token, k_pos) to its expert slot
+        total_assigns = len(s_tok)
+        # Remap expert IDs to slot indices (0..num_unique-1)
+        eidx_to_slot = np.zeros(256, dtype=np.int32)
+        for gi, eidx in enumerate(unique_experts):
+            eidx_to_slot[int(eidx)] = gi
+        slot_arr = mx.array(eidx_to_slot[s_exp].astype(np.int32))
+        tok_arr = mx.array(s_tok.astype(np.int32))
+        dims_p1 = mx.array([edim, h, total_assigns], dtype=mx.int32)
+        dims_p2 = mx.array([h, edim, total_assigns], dtype=mx.int32)
 
-            x_batch = x_gpu[toks.tolist()]
-            # Fused quantized_matmul: 9.7x faster than dequantize+matmul
-            go = mx.quantized_matmul(x_batch, all_gw[gi], scales=all_gs[gi].view(mx.bfloat16), biases=all_gb[gi].view(mx.bfloat16), transpose=True, group_size=gs, bits=4)
-            uo = mx.quantized_matmul(x_batch, all_uw[gi], scales=all_us[gi].view(mx.bfloat16), biases=all_ub[gi].view(mx.bfloat16), transpose=True, group_size=gs, bits=4)
-            act = (go / (1 + mx.exp(-go))) * uo
-            out = mx.quantized_matmul(act, all_dw[gi], scales=all_ds[gi].view(mx.bfloat16), biases=all_db[gi].view(mx.bfloat16), transpose=True, group_size=gs, bits=4).astype(mx.float16)
+        # Phase 1: gate+up+SiLU — ONE Metal dispatch, one thread per (assign, row)
+        activated = _metal_phase1(
+            inputs=[x_gpu, all_gw, all_gs, all_gb, all_uw, all_us, all_ub,
+                    slot_arr, tok_arr, dims_p1],
+            output_shapes=[(total_assigns * edim,)],
+            output_dtypes=[mx.float32],
+            grid=(total_assigns * edim, 1, 1),
+            threadgroup=(min(256, edim), 1, 1),
+        )[0]
 
-            lazy_results.append(out)
-            scatter_info.append((toks, kpos))
+        # Phase 2: down projection — ONE Metal dispatch
+        flat_output = _metal_phase2(
+            inputs=[activated, all_dw, all_ds, all_db, slot_arr, dims_p2],
+            output_shapes=[(total_assigns * h,)],
+            output_dtypes=[mx.float16],
+            grid=(total_assigns * h, 1, 1),
+            threadgroup=(min(256, h), 1, 1),
+        )[0]
 
-        # ONE eval for entire layer
-        if lazy_results:
-            mx.eval(*lazy_results)
+        mx.eval(flat_output)
 
-        # Scatter
-        for out_mx, (toks, kpos) in zip(lazy_results, scatter_info):
-            out_arr = np.array(out_mx, copy=False)
-            for i in range(len(toks)):
-                out_np[toks[i], kpos[i]] = out_arr[i]
+        # Scatter results to output
+        flat_out_np = np.array(flat_output, copy=False).reshape(total_assigns, h)
+        for i in range(total_assigns):
+            out_np[s_tok[i], s_k[i]] = flat_out_np[i]
 
     def _batched_prefill_experts(self, x_view, idx_np, actual_tokens, K, out_np):
         """Prefill: one C call per layer, grouped by expert.
