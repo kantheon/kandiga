@@ -216,6 +216,18 @@ _prefetch_state = {
 }
 
 
+@mx.compile
+def _compiled_expert_mlp(x, gw, gs, gb, uw, us, ub, dw, ds, db):
+    """Compiled expert MLP: dequantize + matmul + SiLU + down. Graph reused."""
+    g = mx.dequantize(gw, gs, gb, group_size=64, bits=4)
+    u = mx.dequantize(uw, us, ub, group_size=64, bits=4)
+    d = mx.dequantize(dw, ds, db, group_size=64, bits=4)
+    go = x @ g.T
+    uo = x @ u.T
+    act = (go / (1 + mx.exp(-go))) * uo
+    return (act @ d.T).astype(mx.float16)
+
+
 def _prefetch_experts_to_page_cache(packed_dir: str, layer_idx: int,
                                      expert_indices: list, expert_size: int):
     """Background thread: pread experts to warm OS page cache."""
@@ -359,7 +371,6 @@ class _CPUSwitchGLU(nn.Module):
                 tensors.append(mx.array(np.frombuffer(raw, dtype=dt, count=rows*cols, offset=off).reshape(rows, cols)))
             gw, gs_, gb, uw, us, ub, dw, ds, db = tensors
 
-            # Gather + GPU matmul (lazy)
             x_batch = x_gpu[toks.tolist()]
             g = mx.dequantize(gw, gs_.view(mx.bfloat16), gb.view(mx.bfloat16), group_size=gs, bits=4)
             u = mx.dequantize(uw, us.view(mx.bfloat16), ub.view(mx.bfloat16), group_size=gs, bits=4)
