@@ -30,9 +30,9 @@ function AnimatedNumber({ value, suffix = '', duration = 1500 }) {
 
 const stats = [
   { value: 397, suffix: 'B', label: 'Largest model', sub: 'Qwen3.5-397B on any Mac' },
-  { value: 13, suffix: 'x', label: 'RAM reduction', sub: '20GB → 1.5GB for 35B model' },
-  { value: 6.5, suffix: ' t/s', label: 'Fast mode', sub: 'K=4 on Apple M4' },
-  { value: 3.8, suffix: 'x', label: 'Cache compression', sub: '16K+ context on 16GB Mac' },
+  { value: 13, suffix: 'x', label: 'RAM reduction', sub: '20GB → 2GB for 35B model' },
+  { value: 6.5, suffix: ' t/s', label: 'Decode speed', sub: '35B K=4 on Apple M4' },
+  { value: 5.5, suffix: 'x', label: 'Prefill speedup', sub: 'Custom Metal GPU kernels' },
 ]
 
 const rows = [

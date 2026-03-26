@@ -1,7 +1,7 @@
 [project]
 name = "kandiga"
-version = "0.5.1"
-description = "Run frontier MoE models on consumer hardware. 35B in 1.5GB RAM."
+version = "0.6.0"
+description = "Run 35B-397B MoE models in 2-8GB RAM. Custom Metal GPU kernels. Any Mac."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"

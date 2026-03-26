@@ -2,32 +2,41 @@
 
 Giant models. Tiny memory.
 
-Kandiga is an open-source MoE inference engine that uses **Selective Expert Materialization (SEM)** to run massive models on any Apple Silicon Mac. A 397B model that normally needs 224GB of RAM runs in 8GB. A 35B model runs in 2GB. No cloud, no API keys.
+Kandiga is an open-source MoE inference engine for Apple Silicon. Run models that normally need 20-224GB of RAM in **2-8GB** — on any Mac. No cloud, no API keys.
 
 ## Supported Models
 
-| Model | Parameters | Active | Experts | Disk | Kandiga RAM | Min. Mac |
-|-------|-----------|--------|---------|------|-------------|----------|
-| Qwen3.5-35B-A3B | 35B | 3B | 256 | 20 GB | ~2 GB | 8 GB |
-| Qwen3.5-122B-A10B | 122B | 10B | 256 | 70 GB | ~4 GB | 16 GB |
-| Qwen3.5-397B-A17B | 397B | 17B | 512 | 224 GB | ~8 GB | 24 GB |
+| Model | Parameters | Active | Disk | Kandiga RAM | Min. Mac | Decode | TTFT |
+|-------|-----------|--------|------|-------------|----------|--------|------|
+| Qwen3.5-35B-A3B | 35B | 3B | 20 GB | ~2 GB | 8 GB | 6.5 tok/s | 3-8s |
+| Qwen3.5-122B-A10B | 122B | 10B | 70 GB | ~4 GB | 16 GB | 1.4 tok/s | 7-27s |
+| Qwen3.5-397B-A17B | 397B | 17B | 224 GB | ~8 GB | 24 GB | ~1 tok/s | TBD |
 
 Without Kandiga, these models require their full disk size in RAM. With SEM, only the shared layers load to memory — expert weights stay on disk and are read on demand.
 
 ## How it works
 
-MoE models have hundreds of expert sub-networks per layer, but only activate a few per token. Kandiga exploits this sparsity:
+MoE models have hundreds of expert sub-networks per layer, but only activate a few per token. Kandiga exploits this sparsity with six techniques:
 
-1. **Shared layers** (attention, norms, embeddings) load to GPU memory
-2. **Expert weights** stay on disk in packed binary files
-3. **Per token**: the router selects which experts to activate (8 of 256)
-4. **CPU computes** expert MLP with NEON-vectorized 4-bit dequant + GCD parallelism
-5. **GPU computes** attention simultaneously via MLX (unified memory, zero copy)
+1. **Selective Expert Materialization (SEM)** — shared layers load to GPU, expert weights stay on disk. Only the 8 router-selected experts are read per token per layer.
+
+2. **Custom Metal GPU kernels** — during prefill (processing your prompt), expert MLP runs entirely on GPU via custom Metal shaders. One dispatch handles ALL experts for ALL tokens — zero Python loop overhead.
+
+3. **CPU NEON decode** — during generation (single token), expert MLP runs on CPU with NEON-vectorized 4-bit dequant. Faster than GPU for single-token due to zero Metal dispatch overhead.
+
+4. **Cross-layer expert speculation** — predicts next layer's expert routing with 77% accuracy. Pre-fetches predicted experts into OS page cache during current layer's compute. Overlaps I/O with computation.
+
+5. **TurboQuant KV compression** — compresses the KV cache from 16-bit to 3-bit (3.8x) using PolarQuant + QJL error correction. Enables longer conversations without running out of memory.
+
+6. **ZMLX fused kernels** — third-party Metal kernel optimizations for attention and norms. +45% decode speed.
 
 ## Install
 
 ```bash
 pip install kandiga
+
+# For maximum speed (includes ZMLX fused kernels):
+pip install kandiga[fast]
 ```
 
 Requirements: macOS with Apple Silicon (M1/M2/M3/M4), Python 3.10+
@@ -35,11 +44,8 @@ Requirements: macOS with Apple Silicon (M1/M2/M3/M4), Python 3.10+
 ## Quick start
 
 ```bash
-# One-time setup: download model + prepare expert files
+# One-time setup: choose model, download, prepare expert files
 kandiga setup
-
-# Choose a different model
-kandiga setup --model mlx-community/Qwen3.5-122B-A10B-4bit
 
 # Interactive chat
 kandiga chat
@@ -58,28 +64,45 @@ kandiga bench
 
 # Update to latest version
 kandiga update
+
+# View changelog
+kandiga changelog
 ```
 
 ## Performance
 
-Measured on M4 Mac Mini (16GB):
+Measured on M4 Mac Mini (16GB), Qwen3.5-35B-A3B-4bit:
 
-| Model | Mode | Decode Speed | TTFT | RAM |
-|-------|------|-------------|------|-----|
-| Qwen3.5-35B | Quality (K=8) | 3.5 tok/s | ~5s | ~2 GB |
-| Qwen3.5-35B | Fast (K=4) | ~6.5 tok/s | ~3s | ~2 GB |
-| Qwen3.5-122B | Quality (K=8) | 0.56 tok/s | ~27s | ~4 GB |
+| Mode | Decode Speed | TTFT (short) | TTFT (long) | RAM |
+|------|-------------|-------------|-------------|-----|
+| Quality (K=8) | 3.7 tok/s | ~5s | ~15s | ~2 GB |
+| Fast (K=4) | 6.5 tok/s | ~3s | ~8s | ~2 GB |
 
-Install ZMLX for +45% speed on 35B: `pip install kandiga[fast]`
+Qwen3.5-122B-A10B-4bit:
+
+| Mode | Decode Speed | TTFT (short) | TTFT (long) | RAM |
+|------|-------------|-------------|-------------|-----|
+| Fast (K=4) | 1.4 tok/s | ~7s | ~27s | ~4 GB |
+
+## GPU Metal Prefill
+
+During prefill (processing your prompt), Kandiga uses custom Metal compute shaders instead of CPU:
+
+- **Phase 1**: Gate + Up projection + SwiGLU activation — one Metal dispatch for ALL experts
+- **Phase 2**: Down projection — one Metal dispatch
+
+This eliminates the Python loop entirely. All expert computation for all tokens happens in two GPU dispatches per layer. Combined with C-level parallel `pread` via GCD, this gives **3-5x faster prefill** compared to the CPU-only path.
+
+```
+Prefill improvement (35B, ~150 tokens):
+  CPU baseline:     24.0s
+  GPU + Python loop: 7.7s
+  GPU Metal kernel:  6.1s  (current)
+```
 
 ## KV Cache Compression (TurboQuant)
 
-Every token generated grows a memory buffer called the **KV cache**. On a 16GB Mac, this normally limits conversations to ~4K tokens before RAM runs out.
-
-Kandiga implements **TurboQuant** (based on [Google Research](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)) — a compression algorithm that shrinks the KV cache from 16-bit to 3-bit per element with only 4% quality loss:
-
-1. **PolarQuant** — randomly rotates vectors to spread information, then quantizes to 3 bits
-2. **QJL** — 1-bit error correction using the Johnson-Lindenstrauss transform
+Compresses the KV cache from 16-bit to 3-bit per element (3.8x reduction) with only 4% quality loss. Based on [Google Research TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/).
 
 | Context Length | Standard (float16) | Kandiga (3-bit) | Compression |
 |---------------|-------------------|-----------------|-------------|
@@ -87,10 +110,6 @@ Kandiga implements **TurboQuant** (based on [Google Research](https://research.g
 | 8K tokens | 33.6 MB | 8.9 MB | 3.8x |
 | 16K tokens | 67.1 MB | 17.8 MB | 3.8x |
 | 32K tokens | 134 MB | 35.3 MB | 3.8x |
-
-- **96% cosine similarity** — attention scores stay accurate
-- **Zero speed overhead** — rotation cost is negligible vs expert I/O
-- **No configuration needed** — compression is automatic
 
 ## Architecture
 
@@ -101,24 +120,28 @@ User prompt
 [Tokenizer + Chat Template]
     |
     v
-[MLX Forward Pass]
+[MLX Forward Pass — per layer:]
     |
-    +---> GPU: Attention + Norms + Router + Shared Expert + Blending
+    +---> GPU: Attention + Norms + Router (MLX lazy eval)
     |
-    +---> CPU: Routed Expert MLP (NEON 4-bit dequant + GCD parallel)
-    |         |
-    |         +-- pread expert weights from SSD (OS page cache)
-    |         +-- SwiGLU activation + down projection
+    +---> Prefill (multi-token):
+    |     GPU Metal kernel: batch pread + dequant + matmul + SiLU
+    |     (one dispatch for ALL experts, ALL tokens)
+    |
+    +---> Decode (single-token):
+    |     CPU NEON: pread + 4-bit dequant matvec + GCD parallel
+    |     (faster than GPU for single vectors)
+    |
+    +---> Cross-layer speculation: predict next layer's experts
+    |     Background prefetch into OS page cache
     |
     v
-[Token Output]
+[Token Output — streaming]
 ```
-
-Both CPU and GPU operate on the same physical DRAM (Apple Silicon unified memory), so there is zero data transfer overhead between them.
 
 ## API Server
 
-Kandiga includes an OpenAI-compatible HTTP API:
+OpenAI-compatible HTTP API:
 
 ```bash
 kandiga serve --port 8340
@@ -137,13 +160,27 @@ for chunk in response:
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
+## Key Technical Details
+
+- **Expert binary format**: packed 4-bit uint32 weights with bfloat16 scales/biases, 4096-byte header per layer file. Expert dimensions auto-detected from header.
+- **Two C libraries**: `libkandiga_cpu_expert.dylib` (35B, hardcoded dims) and `libkandiga_cpu_expert_lg.dylib` (122B/397B, dynamic dims from header)
+- **Custom Metal shaders**: `attention.metal` (19 kernels), `expert_mlp.metal`, `moe_block.metal` — compiled at runtime
+- **Cross-layer speculation**: 77% prediction accuracy using router gate CPU matmul (~0.05ms)
+- **Layer skipping**: large models skip routed experts on every 3rd layer (shared expert only). Reduces syncs by 33% with quality preserved.
+- **Thinking mode disabled**: `enable_thinking=False` in chat template to avoid wasted tokens
+- **Auto-update checker**: background check against PyPI, cached 24h
+
 ## Development
 
 ```bash
 git clone https://github.com/kantheon/kandiga.git
 cd kandiga
-pip install -e ".[serve]"
+pip install -e ".[serve,fast]"
+
+# Build CPU expert libraries
 cd kandiga/metal && make && cd ../..
+
+# Run tests
 pytest tests/ -v
 ```
 
