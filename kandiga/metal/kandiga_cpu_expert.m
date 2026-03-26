@@ -627,3 +627,41 @@ int bakan_cpu_expert_mlp_prefill_f16(
 
     return 0;
 }
+
+/* ----------------------------------------------------------------------- */
+/* bakan_cpu_expert_pread_batch — Batch pread unique experts into buffer    */
+/*                                                                          */
+/* Reads N unique experts in parallel (GCD), returns raw bytes in order.   */
+/* Python then creates mx.arrays directly from the buffer — no per-expert  */
+/* pread syscall from Python.                                               */
+/* ----------------------------------------------------------------------- */
+int bakan_cpu_expert_pread_batch(
+    void* engine_ptr,
+    int layer_idx,
+    const int32_t* expert_ids,
+    int num_experts_to_read,
+    void* output_buffer  /* caller-allocated: num_experts * EXPERT_SIZE bytes */
+) {
+    KandigaCPUExpertEngine* engine = (KandigaCPUExpertEngine*)engine_ptr;
+    if (!engine || layer_idx < 0 || layer_idx >= engine->num_layers) return -1;
+
+    int fd = engine->layer_fds[layer_idx];
+    char* out = (char*)output_buffer;
+
+    /* Parallel pread via GCD */
+    __block int err = 0;
+    dispatch_group_t group = dispatch_group_create();
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+
+    for (int i = 0; i < num_experts_to_read; i++) {
+        int eidx = expert_ids[i];
+        char* dst = out + (size_t)i * EXPERT_SIZE;
+        dispatch_group_async(group, q, ^{
+            off_t offset = (off_t)HEADER_SIZE + (off_t)eidx * (off_t)EXPERT_SIZE;
+            ssize_t n = pread(fd, dst, EXPERT_SIZE, offset);
+            if (n != (ssize_t)EXPERT_SIZE) err = 1;
+        });
+    }
+    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+    return err ? -1 : 0;
+}

@@ -118,6 +118,14 @@ class _CPUExpertLib:
         ]
         self._lib.bakan_cpu_expert_mlp_bf16.restype = ctypes.c_int
 
+        # bakan_cpu_expert_pread_batch
+        self._lib.bakan_cpu_expert_pread_batch.argtypes = [
+            ctypes.c_void_p, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int32), ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        self._lib.bakan_cpu_expert_pread_batch.restype = ctypes.c_int
+
         # bakan_cpu_expert_mlp_prefill_f16
         self._lib.bakan_cpu_expert_mlp_prefill_f16.argtypes = [
             ctypes.c_void_p, ctypes.c_int,  # engine, layer
@@ -342,11 +350,25 @@ class _CPUSwitchGLU(nn.Module):
         changes = np.concatenate([[0], np.where(np.diff(s_exp))[0] + 1, [len(s_exp)]])
         unique_experts = s_exp[changes[:-1]]
 
-        # Open file, get x on GPU
+        # Get x on GPU
         layer_path = os.path.join(self._packed_dir, f"layer_{self._layer_idx:02d}.bin")
         fd = os.open(layer_path, os.O_RDONLY)
         x_gpu = x_flat.astype(mx.float16)
         mx.eval(x_gpu)
+
+        import ctypes
+        num_unique = len(unique_experts)
+
+        # ONE C call: parallel pread ALL unique experts (GCD dispatch)
+        raw_buf = np.empty(num_unique * esz, dtype=np.uint8)
+        unique_i32 = np.ascontiguousarray(unique_experts.astype(np.int32))
+        self._cpu_lib._lib.bakan_cpu_expert_pread_batch(
+            self._cpu_engine, self._layer_idx,
+            unique_i32.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            num_unique,
+            raw_buf.ctypes.data_as(ctypes.c_void_p),
+        )
+        os.close(fd)
 
         # Expert tensor offsets (35B)
         OFS = [(0, 512, 256, np.uint32), (524288, 512, 32, np.uint16), (557056, 512, 32, np.uint16),
@@ -356,25 +378,26 @@ class _CPUSwitchGLU(nn.Module):
         lazy_results = []
         scatter_info = []
 
-        for gi in range(len(unique_experts)):
-            eidx = int(unique_experts[gi])
+        # Stack ALL expert tensors into 9 big arrays (9 mx.array calls, not 1800)
+        def stack_all(off, rows, cols, dt):
+            isz = 4 if dt == np.uint32 else 2
+            arrs = [raw_buf[gi*esz+off:gi*esz+off+rows*cols*isz].view(dt).reshape(rows, cols) for gi in range(num_unique)]
+            return mx.array(np.stack(arrs))
+
+        all_gw = stack_all(*OFS[0]); all_gs = stack_all(*OFS[1]); all_gb = stack_all(*OFS[2])
+        all_uw = stack_all(*OFS[3]); all_us = stack_all(*OFS[4]); all_ub = stack_all(*OFS[5])
+        all_dw = stack_all(*OFS[6]); all_ds = stack_all(*OFS[7]); all_db = stack_all(*OFS[8])
+
+        # GPU matmul per expert (from stacked — just slice, no new mx.array)
+        for gi in range(num_unique):
             start, end = int(changes[gi]), int(changes[gi + 1])
             toks = s_tok[start:end]
             kpos = s_k[start:end]
 
-            # pread once
-            raw = os.pread(fd, esz, 4096 + eidx * esz)
-
-            # Parse 9 tensors
-            tensors = []
-            for off, rows, cols, dt in OFS:
-                tensors.append(mx.array(np.frombuffer(raw, dtype=dt, count=rows*cols, offset=off).reshape(rows, cols)))
-            gw, gs_, gb, uw, us, ub, dw, ds, db = tensors
-
             x_batch = x_gpu[toks.tolist()]
-            g = mx.dequantize(gw, gs_.view(mx.bfloat16), gb.view(mx.bfloat16), group_size=gs, bits=4)
-            u = mx.dequantize(uw, us.view(mx.bfloat16), ub.view(mx.bfloat16), group_size=gs, bits=4)
-            d = mx.dequantize(dw, ds.view(mx.bfloat16), db.view(mx.bfloat16), group_size=gs, bits=4)
+            g = mx.dequantize(all_gw[gi], all_gs[gi].view(mx.bfloat16), all_gb[gi].view(mx.bfloat16), group_size=gs, bits=4)
+            u = mx.dequantize(all_uw[gi], all_us[gi].view(mx.bfloat16), all_ub[gi].view(mx.bfloat16), group_size=gs, bits=4)
+            d = mx.dequantize(all_dw[gi], all_ds[gi].view(mx.bfloat16), all_db[gi].view(mx.bfloat16), group_size=gs, bits=4)
             go = x_batch @ g.T
             uo = x_batch @ u.T
             act = (go / (1 + mx.exp(-go))) * uo
@@ -382,8 +405,6 @@ class _CPUSwitchGLU(nn.Module):
 
             lazy_results.append(out)
             scatter_info.append((toks, kpos))
-
-        os.close(fd)
 
         # ONE eval for entire layer
         if lazy_results:
