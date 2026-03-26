@@ -296,3 +296,24 @@ void bakan_cpu_expert_destroy(void* ptr) {
 int bakan_cpu_expert_num_layers(void* ptr) {
     return ptr ? ((Engine*)ptr)->num_layers : 0;
 }
+
+/* Batch pread for prefill */
+int bakan_cpu_expert_pread_batch(void* ptr, int li,
+    const int32_t* ids, int num, void* out_buf) {
+    Engine* e=(Engine*)ptr;
+    if(!e||li<0||li>=e->num_layers) return -1;
+    int fd=e->layer_fds[li]; size_t esz=e->expert_size;
+    char* out=(char*)out_buf;
+    __block int err=0;
+    dispatch_group_t g=dispatch_group_create();
+    dispatch_queue_t q=dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0);
+    for(int i=0;i<num;i++){
+        int eidx=ids[i]; char* dst=out+(size_t)i*esz;
+        dispatch_group_async(g,q,^{
+            off_t o=(off_t)HEADER_SIZE+(off_t)eidx*(off_t)esz;
+            if(pread(fd,dst,esz,o)!=(ssize_t)esz) err=1;
+        });
+    }
+    dispatch_group_wait(g,DISPATCH_TIME_FOREVER);
+    return err?-1:0;
+}

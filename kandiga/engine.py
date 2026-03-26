@@ -126,8 +126,9 @@ class _CPUExpertLib:
         ]
         self._lib.bakan_cpu_expert_pread_batch.restype = ctypes.c_int
 
-        # bakan_cpu_expert_mlp_prefill_f16
-        self._lib.bakan_cpu_expert_mlp_prefill_f16.argtypes = [
+        # bakan_cpu_expert_mlp_prefill_f16 (35B only — lg library doesn't have it)
+        try:
+            self._lib.bakan_cpu_expert_mlp_prefill_f16.argtypes = [
             ctypes.c_void_p, ctypes.c_int,  # engine, layer
             ctypes.c_void_p,                 # x_f16
             ctypes.c_int, ctypes.c_int, ctypes.c_int,  # num_tokens, K, hidden
@@ -139,7 +140,9 @@ class _CPUExpertLib:
             ctypes.c_int,                     # num_unique
             ctypes.c_void_p,                 # output
         ]
-        self._lib.bakan_cpu_expert_mlp_prefill_f16.restype = ctypes.c_int
+            self._lib.bakan_cpu_expert_mlp_prefill_f16.restype = ctypes.c_int
+        except (AttributeError, OSError):
+            pass  # lg library doesn't have this function
 
         # bakan_cpu_expert_destroy(engine)
         self._lib.bakan_cpu_expert_destroy.argtypes = [ctypes.c_void_p]
@@ -387,20 +390,19 @@ class _CPUSwitchGLU(nn.Module):
         preads each expert once, GPU batched dequant+matmul.
         """
         h = self._hidden_size
-        if h != 2048:
-            # Non-35B: fallback to CPU
+        idx_np = np.array(idx_i32, copy=False).astype(np.int32)
+        gs = 64
+        esz = self._expert_size
+
+        if esz == 0:
+            # No expert size info — fallback to CPU
             mlp_func = self._cpu_lib.expert_mlp_f16
             x_np_raw = np.array(x_flat.astype(mx.float16), copy=False)
             mx.eval(x_flat)
-            idx_np = np.array(idx_i32, copy=False).astype(np.int32)
             for t in range(num_tokens):
                 out_np[t] = mlp_func(self._cpu_engine, self._layer_idx,
                     np.ascontiguousarray(x_np_raw[t]), idx_np[t], K, hidden_size=h)
             return
-
-        idx_np = np.array(idx_i32, copy=False).astype(np.int32)
-        gs = 64
-        esz = self._expert_size
 
         # Vectorized grouping using numpy (no Python dicts)
         flat_tok = np.repeat(np.arange(num_tokens, dtype=np.int32), K)
@@ -435,16 +437,39 @@ class _CPUSwitchGLU(nn.Module):
         )
         os.close(fd)
 
-        # Expert tensor offsets (35B)
-        OFS = [(0, 512, 256, np.uint32), (524288, 512, 32, np.uint16), (557056, 512, 32, np.uint16),
-               (589824, 512, 256, np.uint32), (1114112, 512, 32, np.uint16), (1146880, 512, 32, np.uint16),
-               (1179648, 2048, 64, np.uint32), (1703936, 2048, 8, np.uint16), (1736704, 2048, 8, np.uint16)]
+        # Compute expert tensor offsets dynamically from model dimensions
+        # gate/up: (edim, h/8) uint32, (edim, h/64) bf16 × 2
+        # down: (h, edim/8) uint32, (h, edim/64) bf16 × 2
+        if h == 2048:
+            edim = 512
+        elif h == 3072:
+            edim = 1024
+        else:
+            edim = h // 4  # fallback guess
+
+        packed_h = h // 8
+        groups_h = h // gs
+        packed_e = edim // 8
+        groups_e = edim // gs
+
+        gate_w_size = edim * packed_h * 4
+        gate_s_size = edim * groups_h * 2
+        up_w_size = gate_w_size
+        up_s_size = gate_s_size
+        down_w_size = h * packed_e * 4
+        down_s_size = h * groups_e * 2
+
+        off = 0
+        OFS = []
+        for rows, cols, dt in [(edim, packed_h, np.uint32), (edim, groups_h, np.uint16), (edim, groups_h, np.uint16),
+                                (edim, packed_h, np.uint32), (edim, groups_h, np.uint16), (edim, groups_h, np.uint16),
+                                (h, packed_e, np.uint32), (h, groups_e, np.uint16), (h, groups_e, np.uint16)]:
+            isz = 4 if dt == np.uint32 else 2
+            OFS.append((off, rows, cols, dt))
+            off += rows * cols * isz
 
         lazy_results = []
         scatter_info = []
-
-        # Stack expert tensors into flat arrays for Metal kernel
-        edim = 512  # 35B expert_dim
         def stack_flat(off, rows, cols, dt):
             isz = 4 if dt == np.uint32 else 2
             arrs = [raw_buf[gi*esz+off:gi*esz+off+rows*cols*isz].view(dt).reshape(rows*cols) for gi in range(num_unique)]
