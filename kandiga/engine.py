@@ -964,7 +964,7 @@ class KandigaEngine:
         temp: float = 0.0,
         stream: bool = True,
     ):
-        """Generate a response.
+        """Generate a response (single turn, no history).
 
         If stream=True, yields tokens one at a time.
         If stream=False, returns the full response string.
@@ -974,7 +974,6 @@ class KandigaEngine:
 
         messages = [{"role": "user", "content": prompt}]
 
-        # Apply chat template with thinking disabled (saves token budget)
         try:
             formatted = self._tokenizer.apply_chat_template(
                 messages,
@@ -1000,6 +999,123 @@ class KandigaEngine:
                 verbose=False,
             )
             return _strip_thinking(response)
+
+    # ------------------------------------------------------------------
+    # Persistent KV cache for multi-turn conversations
+    # ------------------------------------------------------------------
+
+    def start_session(self):
+        """Start a new conversation session with persistent KV cache.
+
+        The KV cache is maintained between calls to session_generate().
+        The model only processes NEW tokens each turn — previous turns
+        are already cached. This eliminates re-processing the entire
+        conversation history on every message.
+
+        Call end_session() or start_session() again to reset.
+        """
+        if not self._ready:
+            self.load()
+        self._session_cache = self._model.make_cache()
+        self._session_history = []
+        self._session_tokens_fed = []  # exact tokens that went through the model
+
+    def end_session(self):
+        """End the conversation session and free the KV cache."""
+        self._session_cache = None
+        self._session_history = []
+        self._session_tokens_fed = []
+
+    def session_generate(
+        self,
+        user_message: str,
+        max_tokens: int = 2048,
+        temp: float = 0.0,
+    ):
+        """Generate a response in an active session (persistent KV cache).
+
+        Only processes the NEW user message through the model.
+        Previous conversation turns are already in the KV cache.
+        TTFT stays constant regardless of conversation length.
+
+        Yields tokens one at a time (streaming).
+        """
+        if not self._ready:
+            self.load()
+        if not hasattr(self, '_session_cache') or self._session_cache is None:
+            self.start_session()
+
+        # Build the FULL conversation including new message
+        self._session_history.append({"role": "user", "content": user_message})
+
+        try:
+            full_text = self._tokenizer.apply_chat_template(
+                self._session_history,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            full_text = self._tokenizer.apply_chat_template(
+                self._session_history,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+        full_tokens = self._tokenizer.encode(full_text)
+
+        # Only process tokens that the KV cache hasn't seen yet
+        num_cached = len(self._session_tokens_fed)
+        new_tokens = full_tokens[num_cached:]
+        if not new_tokens:
+            return
+
+        new_input = mx.array(new_tokens).reshape(1, -1)
+
+        # Prefill new tokens (KV cache extends, doesn't restart)
+        out = self._model(new_input, cache=self._session_cache)
+        mx.eval(out)
+
+        self._session_tokens_fed.extend(new_tokens)
+
+        # Decode loop: generate tokens one at a time
+        sampler = make_sampler(temp=temp)
+        logits = out[0, -1]
+
+        eos_ids = set()
+        if hasattr(self._tokenizer, 'eos_token_id'):
+            eid = self._tokenizer.eos_token_id
+            if isinstance(eid, (list, tuple)):
+                eos_ids = set(eid)
+            elif eid is not None:
+                eos_ids = {eid}
+
+        response_tokens = []
+        for _ in range(max_tokens):
+            token = mx.argmax(logits) if temp == 0 else sampler(mx.expand_dims(logits, 0))[0]
+            mx.eval(token)
+            tid = token.item()
+
+            if tid in eos_ids:
+                break
+
+            response_tokens.append(tid)
+            text = self._tokenizer.decode([tid])
+
+            # Filter thinking tags
+            if "<think>" in text or "</think>" in text:
+                continue
+            yield text
+
+            # Next token through model (extends cache)
+            out = self._model(token.reshape(1, 1), cache=self._session_cache)
+            mx.eval(out)
+            logits = out[0, -1]
+            self._session_tokens_fed.append(tid)
+
+        # Add assistant response to history for future turns
+        full_response = self._tokenizer.decode(response_tokens)
+        self._session_history.append({"role": "assistant", "content": full_response})
 
     def _stream_generate(self, formatted_prompt: str, max_tokens: int, temp: float):
         """Stream tokens using mlx_lm's generate with a callback."""
