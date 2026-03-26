@@ -418,13 +418,15 @@ class _CPUSwitchGLU(nn.Module):
         unique_experts = s_exp[changes[:-1]]
 
         # Get x on GPU
-        layer_path = os.path.join(self._packed_dir, f"layer_{self._layer_idx:02d}.bin")
-        fd = os.open(layer_path, os.O_RDONLY)
         x_gpu = x_flat.astype(mx.float16)
         mx.eval(x_gpu)
 
         import ctypes
         num_unique = len(unique_experts)
+
+        # Free MLX buffer cache before disk reads — releases unified memory
+        # so expert file pages stay in OS page cache
+        mx.clear_cache()
 
         # ONE C call: parallel pread ALL unique experts (GCD dispatch)
         raw_buf = np.empty(num_unique * esz, dtype=np.uint8)
@@ -435,69 +437,60 @@ class _CPUSwitchGLU(nn.Module):
             num_unique,
             raw_buf.ctypes.data_as(ctypes.c_void_p),
         )
-        os.close(fd)
 
-        # Compute expert tensor offsets dynamically from model dimensions
-        # gate/up: (edim, h/8) uint32, (edim, h/64) bf16 × 2
-        # down: (h, edim/8) uint32, (h, edim/64) bf16 × 2
-        if h == 2048:
-            edim = 512
-        elif h == 3072:
-            edim = 1024
-        else:
-            edim = h // 4  # fallback guess
+        # Compute expert tensor layout (cached after first call)
+        if not hasattr(self, '_edim'):
+            if h == 2048:
+                self._edim = 512
+            elif h == 3072:
+                self._edim = 1024
+            else:
+                self._edim = h // 4
+            edim = self._edim
+            packed_h = h // 8
+            groups_h = h // gs
+            packed_e = edim // 8
+            groups_e = edim // gs
+            off = 0
+            self._OFS = []
+            for rows, cols, dt in [
+                (edim, packed_h, np.uint32), (edim, groups_h, np.uint16), (edim, groups_h, np.uint16),
+                (edim, packed_h, np.uint32), (edim, groups_h, np.uint16), (edim, groups_h, np.uint16),
+                (h, packed_e, np.uint32), (h, groups_e, np.uint16), (h, groups_e, np.uint16),
+            ]:
+                isz = 4 if dt == np.uint32 else 2
+                self._OFS.append((off, rows, cols, dt))
+                off += rows * cols * isz
+        edim = self._edim
 
-        packed_h = h // 8
-        groups_h = h // gs
-        packed_e = edim // 8
-        groups_e = edim // gs
+        # Vectorized stack: reshape raw_buf as (num_unique, esz), slice columns
+        experts_2d = raw_buf.reshape(num_unique, esz)
 
-        gate_w_size = edim * packed_h * 4
-        gate_s_size = edim * groups_h * 2
-        up_w_size = gate_w_size
-        up_s_size = gate_s_size
-        down_w_size = h * packed_e * 4
-        down_s_size = h * groups_e * 2
-
-        off = 0
-        OFS = []
-        for rows, cols, dt in [(edim, packed_h, np.uint32), (edim, groups_h, np.uint16), (edim, groups_h, np.uint16),
-                                (edim, packed_h, np.uint32), (edim, groups_h, np.uint16), (edim, groups_h, np.uint16),
-                                (h, packed_e, np.uint32), (h, groups_e, np.uint16), (h, groups_e, np.uint16)]:
+        def stack_v(off, rows, cols, dt):
             isz = 4 if dt == np.uint32 else 2
-            OFS.append((off, rows, cols, dt))
-            off += rows * cols * isz
+            size = rows * cols * isz
+            return mx.array(experts_2d[:, off:off+size].ravel().view(dt))
 
-        lazy_results = []
-        scatter_info = []
-        def stack_flat(off, rows, cols, dt):
-            isz = 4 if dt == np.uint32 else 2
-            arrs = [raw_buf[gi*esz+off:gi*esz+off+rows*cols*isz].view(dt).reshape(rows*cols) for gi in range(num_unique)]
-            return mx.array(np.concatenate(arrs))
+        all_gw = stack_v(*self._OFS[0])
+        all_gs = stack_v(*self._OFS[1]).view(mx.bfloat16).astype(mx.float16)
+        all_gb = stack_v(*self._OFS[2]).view(mx.bfloat16).astype(mx.float16)
+        all_uw = stack_v(*self._OFS[3])
+        all_us = stack_v(*self._OFS[4]).view(mx.bfloat16).astype(mx.float16)
+        all_ub = stack_v(*self._OFS[5]).view(mx.bfloat16).astype(mx.float16)
+        all_dw = stack_v(*self._OFS[6])
+        all_ds = stack_v(*self._OFS[7]).view(mx.bfloat16).astype(mx.float16)
+        all_db = stack_v(*self._OFS[8]).view(mx.bfloat16).astype(mx.float16)
 
-        # Scales/biases are bfloat16 on disk — convert to float16 for Metal kernel
-        all_gw = stack_flat(*OFS[0])
-        all_gs = stack_flat(*OFS[1]).view(mx.bfloat16).astype(mx.float16)
-        all_gb = stack_flat(*OFS[2]).view(mx.bfloat16).astype(mx.float16)
-        all_uw = stack_flat(*OFS[3])
-        all_us = stack_flat(*OFS[4]).view(mx.bfloat16).astype(mx.float16)
-        all_ub = stack_flat(*OFS[5]).view(mx.bfloat16).astype(mx.float16)
-        all_dw = stack_flat(*OFS[6])
-        all_ds = stack_flat(*OFS[7]).view(mx.bfloat16).astype(mx.float16)
-        all_db = stack_flat(*OFS[8]).view(mx.bfloat16).astype(mx.float16)
-
-        # Build assignment arrays: map each (token, k_pos) to its expert slot
+        # Build assignment arrays
         total_assigns = len(s_tok)
-        # Remap expert IDs to slot indices (0..num_unique-1)
         eidx_to_slot = np.zeros(256, dtype=np.int32)
-        for gi, eidx in enumerate(unique_experts):
-            eidx_to_slot[int(eidx)] = gi
+        eidx_to_slot[unique_experts] = np.arange(num_unique, dtype=np.int32)
         slot_arr = mx.array(eidx_to_slot[s_exp].astype(np.int32))
         tok_arr = mx.array(s_tok.astype(np.int32))
         dims_p1 = mx.array([edim, h, total_assigns], dtype=mx.int32)
         dims_p2 = mx.array([h, edim, total_assigns], dtype=mx.int32)
 
-        # Phase 1: gate+up+SiLU — ONE Metal dispatch, one thread per (assign, row)
+        # Phase 1: gate+up+SiLU — ONE Metal dispatch
         activated = _metal_phase1(
             inputs=[x_gpu, all_gw, all_gs, all_gb, all_uw, all_us, all_ub,
                     slot_arr, tok_arr, dims_p1],
@@ -518,10 +511,9 @@ class _CPUSwitchGLU(nn.Module):
 
         mx.eval(flat_output)
 
-        # Scatter results to output
+        # Vectorized scatter
         flat_out_np = np.array(flat_output, copy=False).reshape(total_assigns, h)
-        for i in range(total_assigns):
-            out_np[s_tok[i], s_k[i]] = flat_out_np[i]
+        out_np[s_tok, s_k] = flat_out_np
 
     def _batched_prefill_experts(self, x_view, idx_np, actual_tokens, K, out_np):
         """Prefill: one C call per layer, grouped by expert.
@@ -583,25 +575,38 @@ class _CPUSwitchGLU(nn.Module):
         out_np[:] = out_flat.reshape(actual_tokens, K, self._hidden_size)
 
     def _predict_and_prefetch(self, x_np):
-        """Predict next layer's experts and prefetch in background."""
+        """Predict next layer's experts and prefetch in background.
+
+        For single token (decode): predict top-K from last hidden state.
+        For multi-token (prefill): predict top-K per token, union all unique.
+        Background thread preads predicted experts into OS page cache.
+        """
         if self._next_gate_np is None or self._layer_idx + 1 >= self._num_moe_layers:
             return
 
-        # CPU matmul: logits = x @ gate^T (~0.05ms)
-        x_f32 = x_np[-1].astype(np.float32) if x_np.ndim > 1 else x_np.astype(np.float32)
         try:
-            logits = x_f32 @ self._next_gate_np.T
-        except ValueError:
+            if x_np.ndim == 1 or x_np.shape[0] == 1:
+                # Single token: original path
+                x_f32 = x_np[-1].astype(np.float32) if x_np.ndim > 1 else x_np.astype(np.float32)
+                logits = x_f32 @ self._next_gate_np.T
+                logits -= logits.max()
+                probs = np.exp(logits)
+                probs /= probs.sum()
+                predicted = np.argsort(probs)[-self._top_k:].tolist()
+            else:
+                # Multi-token prefill: predict for ALL tokens, union unique experts
+                x_f32 = x_np.astype(np.float32)
+                logits = x_f32 @ self._next_gate_np.T  # (num_tokens, num_experts)
+                # Top-K per token
+                top_k_per_token = np.argpartition(logits, -self._top_k, axis=1)[:, -self._top_k:]
+                predicted = list(set(top_k_per_token.ravel().tolist()))
+        except (ValueError, IndexError):
             return
-        logits -= logits.max()
-        probs = np.exp(logits)
-        probs /= probs.sum()
-        predicted = np.argsort(probs)[-self._top_k:].tolist()
 
         next_idx = self._layer_idx + 1
         _prefetch_state["predicted"][next_idx] = predicted
 
-        # Start background prefetch
+        # Start background prefetch into OS page cache
         t = threading.Thread(
             target=_prefetch_experts_to_page_cache,
             args=(self._packed_dir, next_idx, predicted, self._expert_size),
@@ -609,6 +614,58 @@ class _CPUSwitchGLU(nn.Module):
         )
         t.start()
         _prefetch_state["thread"] = t
+
+    def _predict_and_prefetch_multi(self, x_np, lookahead=3):
+        """Predict experts for the next N layers and prefetch all into page cache.
+
+        Uses current hidden state to predict which experts each of the next
+        N layers will need. Prefetches all in one background thread.
+        More lookahead = more pages warm when those layers run.
+        """
+        if self._next_gate_np is None:
+            return
+
+        try:
+            # Use mean hidden state across all tokens for prediction
+            x_f32 = x_np.mean(axis=0).astype(np.float32) if x_np.ndim > 1 else x_np.astype(np.float32)
+
+            # Collect all experts to prefetch across next N layers
+            all_prefetch = []  # list of (layer_idx, [expert_ids])
+
+            # We only have the NEXT layer's gate weights. For layers beyond that,
+            # we use the same prediction (approximate but still warms relevant pages)
+            logits = x_f32 @ self._next_gate_np.T
+            logits -= logits.max()
+            probs = np.exp(logits)
+            probs /= probs.sum()
+
+            # For prefill, predict MORE experts per layer (union across tokens)
+            if x_np.ndim > 1 and x_np.shape[0] > 1:
+                all_logits = x_np.astype(np.float32) @ self._next_gate_np.T
+                top_k_all = np.argpartition(all_logits, -self._top_k, axis=1)[:, -self._top_k:]
+                predicted = list(set(top_k_all.ravel().tolist()))
+            else:
+                predicted = np.argsort(probs)[-self._top_k:].tolist()
+
+            # Prefetch for next N layers (same predicted experts — approximate)
+            for offset in range(1, lookahead + 1):
+                next_idx = self._layer_idx + offset
+                if next_idx < self._num_moe_layers:
+                    all_prefetch.append((next_idx, predicted))
+
+            if all_prefetch:
+                def prefetch_multi():
+                    for layer_idx, experts in all_prefetch:
+                        _prefetch_experts_to_page_cache(
+                            self._packed_dir, layer_idx, experts, self._expert_size
+                        )
+
+                t = threading.Thread(target=prefetch_multi, daemon=True)
+                t.start()
+                _prefetch_state["thread"] = t
+
+        except (ValueError, IndexError):
+            pass
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         """Forward pass: expert MLP computed on CPU.
