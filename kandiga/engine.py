@@ -118,14 +118,20 @@ class _CPUExpertLib:
         ]
         self._lib.bakan_cpu_expert_mlp_bf16.restype = ctypes.c_int
 
-        # bakan_cpu_expert_mlp_batch_f16(engine, layer, x_batch, indices_batch,
-        #                                num_tokens, K, output_batch)
-        self._lib.bakan_cpu_expert_mlp_batch_f16.argtypes = [
-            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_int32), ctypes.c_int, ctypes.c_int,
-            ctypes.c_void_p,
+        # bakan_cpu_expert_mlp_prefill_f16
+        self._lib.bakan_cpu_expert_mlp_prefill_f16.argtypes = [
+            ctypes.c_void_p, ctypes.c_int,  # engine, layer
+            ctypes.c_void_p,                 # x_f16
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,  # num_tokens, K, hidden
+            ctypes.POINTER(ctypes.c_int32),  # sorted_token_indices
+            ctypes.POINTER(ctypes.c_int32),  # sorted_expert_indices
+            ctypes.POINTER(ctypes.c_int32),  # sorted_k_positions
+            ctypes.POINTER(ctypes.c_int32),  # group_starts
+            ctypes.POINTER(ctypes.c_int32),  # unique_experts
+            ctypes.c_int,                     # num_unique
+            ctypes.c_void_p,                 # output
         ]
-        self._lib.bakan_cpu_expert_mlp_batch_f16.restype = ctypes.c_int
+        self._lib.bakan_cpu_expert_mlp_prefill_f16.restype = ctypes.c_int
 
         # bakan_cpu_expert_destroy(engine)
         self._lib.bakan_cpu_expert_destroy.argtypes = [ctypes.c_void_p]
@@ -289,6 +295,65 @@ class _CPUSwitchGLU(nn.Module):
             except Exception:
                 pass
 
+    def _batched_prefill_experts(self, x_view, idx_np, actual_tokens, K, out_np):
+        """Prefill: one C call per layer, grouped by expert.
+
+        Groups tokens by expert ID, preads each expert ONCE,
+        computes all tokens with expert weights hot in L1/L2 cache.
+        """
+        import ctypes
+
+        # Build CSR-style grouped index
+        from collections import defaultdict
+        expert_groups = defaultdict(list)
+        for t in range(actual_tokens):
+            for k in range(K):
+                eidx = int(idx_np[t, k])
+                expert_groups[eidx].append((t, k))
+
+        # Sort by expert ID for sequential disk access
+        sorted_experts = sorted(expert_groups.keys())
+        unique_arr = np.array(sorted_experts, dtype=np.int32)
+        num_unique = len(sorted_experts)
+
+        # Build flat arrays
+        total = sum(len(v) for v in expert_groups.values())
+        tok_indices = np.empty(total, dtype=np.int32)
+        exp_indices = np.empty(total, dtype=np.int32)
+        k_positions = np.empty(total, dtype=np.int32)
+        starts = np.empty(num_unique + 1, dtype=np.int32)
+
+        pos = 0
+        for gi, eidx in enumerate(sorted_experts):
+            starts[gi] = pos
+            for (t, k) in expert_groups[eidx]:
+                tok_indices[pos] = t
+                exp_indices[pos] = eidx
+                k_positions[pos] = k
+                pos += 1
+        starts[num_unique] = pos
+
+        # One C call for the entire layer
+        x_contig = np.ascontiguousarray(np.array(x_view, copy=False))
+        out_flat = np.zeros((actual_tokens * K * self._hidden_size,), dtype=np.float16)
+
+        ret = self._cpu_lib._lib.bakan_cpu_expert_mlp_prefill_f16(
+            self._cpu_engine,
+            self._layer_idx,
+            x_contig.ctypes.data_as(ctypes.c_void_p),
+            actual_tokens, K, self._hidden_size,
+            tok_indices.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            exp_indices.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            k_positions.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            starts.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            unique_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            num_unique,
+            out_flat.ctypes.data_as(ctypes.c_void_p),
+        )
+        if ret != 0:
+            raise RuntimeError(f"Prefill expert MLP failed layer {self._layer_idx}")
+        out_np[:] = out_flat.reshape(actual_tokens, K, self._hidden_size)
+
     def _predict_and_prefetch(self, x_np):
         """Predict next layer's experts and prefetch in background."""
         if self._next_gate_np is None or self._layer_idx + 1 >= self._num_moe_layers:
@@ -366,7 +431,7 @@ class _CPUSwitchGLU(nn.Module):
         if num_tokens == 1:
             self._predict_and_prefetch(x_np)
 
-        # CPU expert compute
+        # Expert compute: per-token C calls
         mlp_func = self._cpu_lib.expert_mlp_bf16 if is_bf16 else self._cpu_lib.expert_mlp_f16
         for t in range(actual_tokens):
             out_np[t] = mlp_func(
