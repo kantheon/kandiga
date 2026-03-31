@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react'
 import Navbar from './components/Navbar'
 import Hero from './components/Hero'
 import Terminal from './components/Terminal'
@@ -8,8 +9,19 @@ import PersistentCache from './components/PersistentCache'
 import Architecture from './components/Architecture'
 import GetStarted from './components/GetStarted'
 import Footer from './components/Footer'
+import CodePage from './components/CodePage'
 
 function App() {
+  const [page, setPage] = useState(window.location.hash)
+
+  useEffect(() => {
+    function onHash() { setPage(window.location.hash) }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
+  if (page === '#code') return <CodePage />
+
   return (
     <div className="min-h-screen">
       <Navbar />
