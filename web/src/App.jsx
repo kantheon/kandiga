@@ -10,6 +10,7 @@ import Architecture from './components/Architecture'
 import GetStarted from './components/GetStarted'
 import Footer from './components/Footer'
 import CodePage from './components/CodePage'
+import TeamCodePage from './components/TeamCodePage'
 
 function App() {
   const [page, setPage] = useState(window.location.hash)
@@ -21,6 +22,7 @@ function App() {
   }, [])
 
   if (page === '#code') return <CodePage />
+  if (page === '#teamcode') return <TeamCodePage />
 
   return (
     <div className="min-h-screen">
