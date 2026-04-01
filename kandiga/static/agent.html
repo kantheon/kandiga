@@ -412,6 +412,45 @@
       background: var(--cyan-dim);
     }
 
+    /* Live stages */
+    .live-stages {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+
+    .stage-live {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--text-secondary);
+      padding: 6px 12px;
+      background: var(--surface-2);
+      border-radius: var(--radius-sm);
+      border-left: 2px solid var(--cyan);
+      animation: stageIn 0.2s ease;
+    }
+
+    .stage-live strong {
+      color: var(--cyan);
+      margin-right: 4px;
+    }
+
+    .stage-live .stage-icon {
+      margin-right: 4px;
+    }
+
+    .stage-live .stage-time {
+      float: right;
+      color: var(--text-dim);
+      font-size: 11px;
+    }
+
+    @keyframes stageIn {
+      from { opacity: 0; transform: translateX(-8px); }
+      to { opacity: 1; transform: translateX(0); }
+    }
+
     /* Loading */
     .loading-dots {
       display: inline-flex;
@@ -600,7 +639,7 @@
       }
     });
 
-    // Send message
+    // Send message — uses SSE stream to show live stage updates
     async function send() {
       const query = inputEl.value.trim();
       if (!query || isGenerating) return;
@@ -614,37 +653,117 @@
       inputEl.value = '';
       inputEl.style.height = 'auto';
 
-      // Add loading
-      const loadingId = 'loading-' + Date.now();
-      const loadingEl = document.createElement('div');
-      loadingEl.id = loadingId;
-      loadingEl.className = 'msg msg-assistant';
-      loadingEl.innerHTML = '<div class="loading-dots"><span></span><span></span><span></span></div>';
-      messagesEl.appendChild(loadingEl);
+      // Add live status area
+      const statusId = 'status-' + Date.now();
+      const statusEl = document.createElement('div');
+      statusEl.id = statusId;
+      statusEl.className = 'msg msg-assistant';
+      statusEl.innerHTML = '<div class="live-stages" id="stages-' + statusId + '"></div><div class="loading-dots"><span></span><span></span><span></span></div>';
+      messagesEl.appendChild(statusEl);
       scrollToBottom();
 
+      const stagesEl = document.getElementById('stages-' + statusId);
+      const startTime = Date.now();
+
       try {
-        const resp = await fetch('/api/query', {
+        const resp = await fetch('/api/stream', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({query}),
         });
-        const data = await resp.json();
 
-        // Remove loading
-        const el = document.getElementById(loadingId);
-        if (el) el.remove();
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
 
-        // Add response
-        addAssistantMessage(data);
+        while (true) {
+          const {done, value} = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, {stream: true});
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const raw = line.slice(6).trim();
+            if (raw === '[DONE]') continue;
+
+            try {
+              const evt = JSON.parse(raw);
+
+              if (evt.type === 'stage') {
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                const stageNames = {
+                  'route': 'Router', 'fast': '4B Fast', 'brain': '35B Brain',
+                  'tools': 'Tools', 'plan': 'Planner', 'session': 'Session', 'done': 'Done',
+                };
+                const label = stageNames[evt.stage] || evt.stage;
+                const chip = document.createElement('div');
+                chip.className = 'stage-live';
+                chip.innerHTML = '<span class="stage-icon">' + getStageIcon(evt.stage) + '</span> <strong>' + label + '</strong> ' + evt.detail + ' <span class="stage-time">' + elapsed + 's</span>';
+                stagesEl.appendChild(chip);
+                // Remove loading dots when brain starts generating
+                if (evt.stage === 'brain') {
+                  const dots = statusEl.querySelector('.loading-dots');
+                  if (dots) { dots.remove(); }
+                  // Add streaming text area
+                  if (!document.getElementById('stream-' + statusId)) {
+                    const streamEl = document.createElement('div');
+                    streamEl.id = 'stream-' + statusId;
+                    streamEl.className = 'msg-assistant';
+                    streamEl.style.marginTop = '8px';
+                    statusEl.appendChild(streamEl);
+                  }
+                }
+                scrollToBottom();
+              }
+
+              if (evt.type === 'token') {
+                // Stream text token by token
+                let streamEl = document.getElementById('stream-' + statusId);
+                if (!streamEl) {
+                  const dots = statusEl.querySelector('.loading-dots');
+                  if (dots) dots.remove();
+                  streamEl = document.createElement('div');
+                  streamEl.id = 'stream-' + statusId;
+                  streamEl.className = 'msg-assistant';
+                  streamEl.style.marginTop = '8px';
+                  statusEl.appendChild(streamEl);
+                }
+                streamEl.textContent += evt.token;
+                scrollToBottom();
+              }
+
+              if (evt.type === 'result') {
+                const el = document.getElementById(statusId);
+                if (el) el.remove();
+                addAssistantMessage(evt);
+              }
+            } catch (e) {}
+          }
+        }
       } catch (err) {
-        const el = document.getElementById(loadingId);
-        if (el) el.innerHTML = `<span style="color:var(--red)">Error: ${err.message}</span>`;
+        const el = document.getElementById(statusId);
+        if (el) el.innerHTML = '<span style="color:var(--red)">Error: ' + err.message + '</span>';
       }
 
       isGenerating = false;
       sendBtn.disabled = false;
       inputEl.focus();
+    }
+
+    function getStageIcon(stage) {
+      const icons = {
+        'route': '&#x2192;',
+        'fast': '&#x26A1;',
+        'brain': '&#x1F9E0;',
+        'tools': '&#x2699;',
+        'plan': '&#x1F4CB;',
+        'session': '&#x1F4BE;',
+        'done': '&#x2713;',
+      };
+      return icons[stage] || '&#x25CF;';
     }
 
     function addMessage(role, content) {

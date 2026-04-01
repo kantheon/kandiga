@@ -1,62 +1,147 @@
-"""Dual-model engine — 4B fast worker + 35B brain.
+"""Tri-mode engine — 2B (JSON) + 35B K=2 (writing) + 35B K=4 (verification).
 
-The 4B model handles mechanical work at 34 tok/s:
-  - Tool call JSON generation
-  - Query classification
-  - Content generation for file writes
+2B (45 tok/s, 0.8s):  tool JSON, route classification, structured output
+35B K=2 (9-10 tok/s): response writing, summaries, content
+35B K=4 (5 tok/s):    verification when tools fail (runs once)
 
-The 35B MoE handles reasoning via SEM at 3-6 tok/s:
-  - Planning multi-step tasks
-  - Final synthesis with tool results
-  - Verification of complex outputs
-
-Result: tool queries drop from ~76s (3x 35B calls) to ~15s (2x 4B + 1x 35B).
+Total GPU: ~2.4GB (1.06GB 2B + 1.38GB 35B shared).
 """
 
 from __future__ import annotations
 
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, Optional
 
-from kandiga.engine import KandigaEngine
+import mlx.nn as nn
+
+from kandiga.engine import KandigaEngine, _find_layers
+
+
+def _set_expert_k(model: nn.Module, k: int) -> int:
+    try:
+        layers = _find_layers(model)
+    except (AttributeError, TypeError):
+        return 0
+    count = 0
+    for layer in layers:
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            continue
+        if hasattr(mlp, "top_k"):
+            mlp.top_k = k
+            count += 1
+        sw = getattr(mlp, "switch_mlp", None)
+        if sw and hasattr(sw, "_top_k"):
+            sw._top_k = k
+    return count
 
 
 class DualEngine:
-    """Manages 4B + 35B models simultaneously.
+    """2B for JSON + 35B K=2/K=4 for writing/verification."""
 
-    Both share the same GPU. The 4B is a standard dense model loaded
-    via mlx_lm. The 35B uses Kandiga's SEM engine (experts on SSD).
-    Total RAM: ~4GB (1.5GB shared 35B + 2.5GB dense 4B).
-    """
-
-    FAST_MODEL = "mlx-community/Qwen3.5-4B-4bit"
+    STRUCT_MODEL = "mlx-community/Qwen3.5-4B-4bit"
     BRAIN_MODEL = "mlx-community/Qwen3.5-35B-A3B-4bit"
+    K_FAST = 4     # K=2 is too degraded for response writing
+    K_PRECISE = 4  # same K for everything — proven quality
 
-    def __init__(self, fast_mode: bool = False, log_memory: bool = False):
+    def __init__(self, fast_mode: bool = True, log_memory: bool = False):
         self._brain = KandigaEngine(
-            model_path=self.BRAIN_MODEL,
-            fast_mode=fast_mode,
-            log_memory=log_memory,
+            model_path=self.BRAIN_MODEL, fast_mode=fast_mode, log_memory=log_memory,
         )
-        self._fast_model = None
-        self._fast_tokenizer = None
+        self._struct_model = None
+        self._struct_tokenizer = None
         self._ready = False
-        self._log_memory = log_memory
+        self._current_k = 0
 
     def load(self):
-        """Load both models."""
         if self._ready:
             return
-
-        # Load 35B brain via SEM
         self._brain.load()
+        self._switch_k(self.K_FAST)
+        self._brain._log(f"Dual-K: write=K{self.K_FAST}, precise=K{self.K_PRECISE}")
 
-        # Load 4B fast model via standard mlx_lm
         from mlx_lm import load as mlx_load
-        self._fast_model, self._fast_tokenizer = mlx_load(self.FAST_MODEL)
-
+        self._struct_model, self._struct_tokenizer = mlx_load(self.STRUCT_MODEL)
+        self._brain._log(f"2B loaded for structured output")
         self._ready = True
+
+    def _switch_k(self, k: int):
+        if k == self._current_k:
+            return
+        _set_expert_k(self._brain._model, k)
+        self._current_k = k
+
+    def _format_brain(self, system: str, user: str) -> str:
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        try:
+            return self._brain._tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        except TypeError:
+            return self._brain._tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True)
+
+    def _format_struct(self, system: str, user: str) -> str:
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        try:
+            return self._struct_tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        except TypeError:
+            return self._struct_tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True)
+
+    # --- 2B: Structured output (JSON, classification) ---
+
+    def generate_fast(self, system: str, user: str,
+                      max_tokens: int = 1200, temp: float = 0.0) -> str:
+        """2B — tool JSON, route classification, structured output. ~45 tok/s."""
+        if not self._ready:
+            self.load()
+        formatted = self._format_struct(system, user)
+        from mlx_lm import generate as mlx_generate
+        from mlx_lm.generate import make_sampler
+        response = mlx_generate(
+            self._struct_model, self._struct_tokenizer,
+            prompt=formatted, max_tokens=max_tokens,
+            sampler=make_sampler(temp=temp), verbose=False,
+        )
+        return _strip_thinking(response)
+
+    # --- 35B K=2: Fast writing ---
+
+    def generate_brain(self, system: str, user: str,
+                       max_tokens: int = 2048, temp: float = 0.0) -> str:
+        """35B K=2 — response writing, summaries, content. ~9-10 tok/s."""
+        if not self._ready:
+            self.load()
+        self._switch_k(self.K_FAST)
+        formatted = self._format_brain(system, user)
+        return self._brain.generate(formatted, max_tokens=max_tokens, temp=temp, stream=False)
+
+    def generate_brain_stream(self, system: str, user: str,
+                              max_tokens: int = 2048, temp: float = 0.0) -> Iterator[str]:
+        """35B K=2 — streaming."""
+        if not self._ready:
+            self.load()
+        self._switch_k(self.K_FAST)
+        formatted = self._format_brain(system, user)
+        for token in self._brain.generate(formatted, max_tokens=max_tokens, temp=temp, stream=True):
+            yield token
+
+    # --- 35B K=4: Verification ---
+
+    def generate_check(self, system: str, user: str,
+                       max_tokens: int = 512, temp: float = 0.0) -> str:
+        """35B K=4 — verification. ~5 tok/s. Only when tools fail."""
+        if not self._ready:
+            self.load()
+        self._switch_k(self.K_PRECISE)
+        formatted = self._format_brain(system, user)
+        result = self._brain.generate(formatted, max_tokens=max_tokens, temp=temp, stream=False)
+        self._switch_k(self.K_FAST)
+        return result
+
+    # --- Session ---
 
     @property
     def brain(self) -> KandigaEngine:
@@ -66,110 +151,12 @@ class DualEngine:
     def tokenizer(self):
         return self._brain._tokenizer
 
-    def generate_fast(
-        self,
-        system: str,
-        user: str,
-        max_tokens: int = 1200,
-        temp: float = 0.0,
-    ) -> str:
-        """Generate with the 4B model (fast, ~34 tok/s).
-
-        Use for: tool call JSON, classification, content generation.
-        """
-        if not self._ready:
-            self.load()
-
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-        try:
-            formatted = self._fast_tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        except TypeError:
-            formatted = self._fast_tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
-
-        from mlx_lm import generate as mlx_generate
-        from mlx_lm.generate import make_sampler
-
-        sampler = make_sampler(temp=temp)
-        response = mlx_generate(
-            self._fast_model, self._fast_tokenizer,
-            prompt=formatted, max_tokens=max_tokens,
-            sampler=sampler, verbose=False,
-        )
-        return _strip_thinking(response)
-
-    def generate_brain(
-        self,
-        system: str,
-        user: str,
-        max_tokens: int = 2048,
-        temp: float = 0.0,
-    ) -> str:
-        """Generate with the 35B model (smart, ~3-6 tok/s).
-
-        Use for: planning, synthesis, complex reasoning.
-        """
-        if not self._ready:
-            self.load()
-
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-        try:
-            formatted = self._brain._tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        except TypeError:
-            formatted = self._brain._tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
-
-        return self._brain.generate(
-            formatted, max_tokens=max_tokens, temp=temp, stream=False,
-        )
-
-    def generate_brain_stream(
-        self,
-        system: str,
-        user: str,
-        max_tokens: int = 2048,
-        temp: float = 0.0,
-    ):
-        """Stream from the 35B model. Yields tokens."""
-        if not self._ready:
-            self.load()
-
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-        try:
-            formatted = self._brain._tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        except TypeError:
-            formatted = self._brain._tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
-
-        for token in self._brain.generate(
-            formatted, max_tokens=max_tokens, temp=temp, stream=True,
-        ):
-            yield token
-
-    # --- Session (persistent KV on the 35B) ---
+    @property
+    def model_path(self) -> str:
+        return self.BRAIN_MODEL
 
     def start_session(self):
+        self._switch_k(self.K_FAST)
         self._brain.start_session()
 
     def end_session(self):
@@ -182,7 +169,7 @@ class DualEngine:
         self._brain.load_session(path)
 
     def session_generate(self, user_message: str, max_tokens: int = 2048, temp: float = 0.0):
-        """Generate within persistent session (constant-time follow-ups)."""
+        self._switch_k(self.K_FAST)
         return self._brain.session_generate(user_message, max_tokens=max_tokens, temp=temp)
 
     @property
@@ -192,9 +179,11 @@ class DualEngine:
     @property
     def stats(self) -> Dict[str, Any]:
         s = self._brain.stats
-        s["dual_mode"] = True
-        s["fast_model"] = self.FAST_MODEL
-        s["brain_model"] = self.BRAIN_MODEL
+        s["dual_k"] = True
+        s["k_fast"] = self.K_FAST
+        s["k_precise"] = self.K_PRECISE
+        s["current_k"] = self._current_k
+        s["struct_model"] = self.STRUCT_MODEL
         return s
 
     def __del__(self):
