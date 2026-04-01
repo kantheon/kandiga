@@ -49,14 +49,16 @@ def _build_tq3_gemv_kernel(K: int, N: int, block_size: int = 32):
     # Each TQ3_1S_shift block: 4x fp16 (d0,d1,m0,m1) + 12 bytes packed = 20 bytes
     # Store as: scales array (4 fp16 per block) + indices array (3 uint32 per block)
 
+    tg_size = min(32, blocks_per_row)  # threads per threadgroup
+
     source = f"""
-    uint row = thread_position_in_grid.x;
+    uint row = threadgroup_position_in_grid.x;
     uint tid = thread_index_in_threadgroup;
-    uint simd_lane = thread_index_in_simdgroup;
 
     const uint K = {K};
     const uint N = {N};
     const uint BLOCKS_PER_ROW = {blocks_per_row};
+    const uint TG_SIZE = {tg_size};
 
     // Lloyd-Max centroids
     const float CENTROIDS[8] = {{{_CENTROIDS_STR}}};
@@ -65,8 +67,8 @@ def _build_tq3_gemv_kernel(K: int, N: int, block_size: int = 32):
 
     float acc = 0.0f;
 
-    // Process blocks assigned to this thread
-    for (uint b = tid; b < BLOCKS_PER_ROW; b += threads_per_threadgroup.x) {{
+    // Each thread processes a subset of blocks
+    for (uint b = tid; b < BLOCKS_PER_ROW; b += TG_SIZE) {{
         // Load scales: d0, d1, m0, m1 (4 fp16 values)
         uint scale_idx = row * BLOCKS_PER_ROW * 4 + b * 4;
         float d0 = float(scales[scale_idx]);
@@ -112,8 +114,22 @@ def _build_tq3_gemv_kernel(K: int, N: int, block_size: int = 32):
         }}
     }}
 
-    // Single thread per row — no reduction needed
-    output[row] = half(acc);
+    // Threadgroup reduction
+    threadgroup float partial[32];
+    partial[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction
+    for (uint stride = {tg_size} / 2; stride > 0; stride >>= 1) {{
+        if (tid < stride) {{
+            partial[tid] += partial[tid + stride];
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    if (tid == 0) {{
+        output[row] = half(partial[0]);
+    }}
     """
 
     return mx.fast.metal_kernel(
@@ -171,11 +187,13 @@ def tq3_gemv(
             results.append(out)
         return mx.stack(results)
 
-    # One threadgroup per row, one thread handles ALL blocks in that row
+    # One threadgroup per row, threads split blocks within the row
+    blocks_per_row = K // 32
+    tg_size = min(32, blocks_per_row)
     return kernel(
         inputs=[x_rot, packed, scales],
-        grid=(N, 1, 1),
-        threadgroup=(1, 1, 1),
+        grid=(N * tg_size, 1, 1),
+        threadgroup=(tg_size, 1, 1),
         output_shapes=[(N,)],
         output_dtypes=[mx.float16],
     )[0]
