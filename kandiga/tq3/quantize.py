@@ -120,20 +120,27 @@ def _unpack_indices(packed: np.ndarray) -> np.ndarray:
 
 @dataclass
 class TQ3Block:
-    """A single TQ3_1S block: 32 weights in 16 bytes."""
+    """A single TQ3_1S_shift block: 32 weights in 18 bytes.
+
+    Stores per-half means for shift variant (higher quality).
+    """
     d0: np.float16      # scale for elements 0-15
     d1: np.float16      # scale for elements 16-31
+    m0: np.float16      # mean for elements 0-15
+    m1: np.float16      # mean for elements 16-31
     qs: np.ndarray       # 12 bytes of packed 3-bit indices
 
     def to_bytes(self) -> bytes:
-        return self.d0.tobytes() + self.d1.tobytes() + self.qs.tobytes()
+        return self.d0.tobytes() + self.d1.tobytes() + self.m0.tobytes() + self.m1.tobytes() + self.qs.tobytes()
 
     @classmethod
     def from_bytes(cls, data: bytes) -> 'TQ3Block':
         d0 = np.frombuffer(data[0:2], dtype=np.float16)[0]
         d1 = np.frombuffer(data[2:4], dtype=np.float16)[0]
-        qs = np.frombuffer(data[4:16], dtype=np.uint8).copy()
-        return cls(d0=d0, d1=d1, qs=qs)
+        m0 = np.frombuffer(data[4:6], dtype=np.float16)[0]
+        m1 = np.frombuffer(data[6:8], dtype=np.float16)[0]
+        qs = np.frombuffer(data[8:20], dtype=np.uint8).copy()
+        return cls(d0=d0, d1=d1, m0=m0, m1=m1, qs=qs)
 
 
 def quantize_block_tq3_1s(weights: np.ndarray) -> TQ3Block:
@@ -175,6 +182,62 @@ def quantize_block_tq3_1s(weights: np.ndarray) -> TQ3Block:
         d1=np.float16(d1),
         qs=_pack_indices(indices),
     )
+
+
+def _quantize_halves_shift_vec(halves: np.ndarray, rms: np.ndarray, means: np.ndarray) -> np.ndarray:
+    """Vectorized quantization with mean subtraction (TQ3_1S_shift).
+
+    Subtracts per-half mean before quantizing → better centering → higher quality.
+    """
+    N = halves.shape[0]
+    scale_mults = np.array([0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.35, 1.50])
+
+    # Center the data
+    centered = halves - means[:, np.newaxis]
+
+    best_scales = rms.copy()
+    best_errors = np.full(N, np.inf)
+
+    for mult in scale_mults:
+        scales = np.maximum(rms * mult, 1e-10)
+        inv = 1.0 / scales
+        normalized = centered * inv[:, np.newaxis]
+
+        indices = np.zeros((N, 16), dtype=np.uint8)
+        for b in range(7):
+            indices[normalized > BOUNDARIES[b]] = b + 1
+
+        deq = CENTROIDS[indices] * scales[:, np.newaxis] + means[:, np.newaxis]
+        errors = np.sum((halves - deq) ** 2, axis=1)
+
+        better = errors < best_errors
+        best_errors[better] = errors[better]
+        best_scales[better] = scales[better]
+
+    # 6 iterations of refinement
+    scales = best_scales.copy()
+    for _ in range(6):
+        inv = 1.0 / np.maximum(scales, 1e-10)
+        normalized = centered * inv[:, np.newaxis]
+
+        indices = np.zeros((N, 16), dtype=np.uint8)
+        for b in range(7):
+            indices[normalized > BOUNDARIES[b]] = b + 1
+
+        centroids_vals = CENTROIDS[indices]
+        numer = np.sum(centered * centroids_vals, axis=1)
+        denom = np.sum(centroids_vals ** 2, axis=1)
+        new_scales = np.where(denom > 1e-12, numer / denom, scales)
+        new_scales = np.maximum(new_scales, 1e-10)
+
+        deq = CENTROIDS[indices] * new_scales[:, np.newaxis] + means[:, np.newaxis]
+        errors = np.sum((halves - deq) ** 2, axis=1)
+        better = errors < best_errors
+        best_errors[better] = errors[better]
+        best_scales[better] = new_scales[better]
+        scales = new_scales
+
+    return best_scales
 
 
 def _quantize_halves_vec(halves: np.ndarray, rms: np.ndarray) -> np.ndarray:
@@ -354,58 +417,98 @@ def quantize_tensor(weights: np.ndarray) -> tuple:
     rms0[rms0 < 1e-10] = 1.0
     rms1[rms1 < 1e-10] = 1.0
 
-    # Fully vectorized quantization with scale refinement
+    # Compute per-block mean in rotated domain for shift variant
+    block_means = np.mean(rotated, axis=1)  # (N,)
+    half0_means = np.mean(half0, axis=1)
+    half1_means = np.mean(half1, axis=1)
+
+    # RMS of centered data (after mean subtraction)
+    centered0 = half0 - half0_means[:, np.newaxis]
+    centered1 = half1 - half1_means[:, np.newaxis]
+    rms0_c = np.sqrt(np.mean(centered0 ** 2, axis=1))
+    rms1_c = np.sqrt(np.mean(centered1 ** 2, axis=1))
+    rms0_c[rms0_c < 1e-10] = 1.0
+    rms1_c[rms1_c < 1e-10] = 1.0
+
+    # Use shift variant for better quality
     all_indices = np.zeros((num_blocks, 32), dtype=np.uint8)
+    all_d0 = _quantize_halves_shift_vec(half0, rms0_c, half0_means)
+    all_d1 = _quantize_halves_shift_vec(half1, rms1_c, half1_means)
 
-    # Vectorized half-block quantization
-    all_d0 = _quantize_halves_vec(half0, rms0)
-    all_d1 = _quantize_halves_vec(half1, rms1)
-
-    # Compute final indices with optimal scales
+    # Compute final indices with optimal scales (with mean subtraction)
     for j in range(16):
-        all_indices[:, j] = _choose_index_vec(half0[:, j] / np.maximum(all_d0, 1e-10))
-        all_indices[:, 16+j] = _choose_index_vec(half1[:, j] / np.maximum(all_d1, 1e-10))
+        all_indices[:, j] = _choose_index_vec((half0[:, j] - half0_means) / np.maximum(all_d0, 1e-10))
+        all_indices[:, 16+j] = _choose_index_vec((half1[:, j] - half1_means) / np.maximum(all_d1, 1e-10))
 
-    # Clamp to fp16 range and pack
+    # Clamp to fp16 range and pack (20 bytes per block: 4 scales + 4 means + 12 indices)
+    BLOCK_BYTES = 20
     max_fp16 = 65504.0
     all_d0 = np.clip(all_d0, -max_fp16, max_fp16)
     all_d1 = np.clip(all_d1, -max_fp16, max_fp16)
+    half0_means = np.clip(half0_means, -max_fp16, max_fp16)
+    half1_means = np.clip(half1_means, -max_fp16, max_fp16)
 
-    blocks_data = bytearray(num_blocks * 16)
+    blocks_data = bytearray(num_blocks * BLOCK_BYTES)
     for i in range(num_blocks):
-        offset = i * 16
+        offset = i * BLOCK_BYTES
         blocks_data[offset:offset+2] = np.float16(all_d0[i]).tobytes()
         blocks_data[offset+2:offset+4] = np.float16(all_d1[i]).tobytes()
+        blocks_data[offset+4:offset+6] = np.float16(half0_means[i]).tobytes()
+        blocks_data[offset+6:offset+8] = np.float16(half1_means[i]).tobytes()
         packed = _pack_indices(all_indices[i])
-        blocks_data[offset+4:offset+16] = packed.tobytes()
+        blocks_data[offset+8:offset+20] = packed.tobytes()
 
     return bytes(blocks_data), weights.shape, num_blocks
 
 
 def dequantize_block_tq3_1s(block: TQ3Block) -> np.ndarray:
-    """Dequantize a TQ3_1S block back to 32 float values."""
+    """Dequantize a TQ3_1S_shift block back to 32 float values."""
     indices = _unpack_indices(block.qs)
     d0 = float(block.d0)
     d1 = float(block.d1)
+    m0 = float(block.m0)
+    m1 = float(block.m1)
 
-    # Reconstruct rotated values from centroids * scale
+    # Reconstruct rotated values: centroid * scale + mean
     rotated = np.zeros(32, dtype=np.float32)
     for j in range(16):
-        rotated[j] = CENTROIDS[indices[j]] * d0
+        rotated[j] = CENTROIDS[indices[j]] * d0 + m0
     for j in range(16):
-        rotated[16 + j] = CENTROIDS[indices[16 + j]] * d1
+        rotated[16 + j] = CENTROIDS[indices[16 + j]] * d1 + m1
 
     # Inverse WHT to get original weight space
     return _wht_inverse(rotated)
 
 
 def dequantize_tensor(blocks_data: bytes, shape: tuple, num_blocks: int) -> np.ndarray:
-    """Dequantize a full TQ3_1S tensor back to float."""
+    """Dequantize a TQ3 tensor. Auto-detects block format (16B or 20B)."""
+    total_data = len(blocks_data)
+    if num_blocks > 0:
+        block_bytes = total_data // num_blocks
+    else:
+        block_bytes = 20
+
     flat = np.zeros(num_blocks * 32, dtype=np.float32)
 
-    for i in range(num_blocks):
-        block = TQ3Block.from_bytes(blocks_data[i * 16: (i + 1) * 16])
-        flat[i * 32: (i + 1) * 32] = dequantize_block_tq3_1s(block)
+    if block_bytes == 16:
+        # Old format: d0, d1, qs (no means)
+        for i in range(num_blocks):
+            data = blocks_data[i * 16: (i + 1) * 16]
+            d0 = np.frombuffer(data[0:2], dtype=np.float16).astype(np.float32)[0]
+            d1 = np.frombuffer(data[2:4], dtype=np.float16).astype(np.float32)[0]
+            qs = np.frombuffer(data[4:16], dtype=np.uint8)
+            indices = _unpack_indices(qs)
+            rotated = np.zeros(32, dtype=np.float32)
+            for j in range(16):
+                rotated[j] = CENTROIDS[indices[j]] * d0
+            for j in range(16):
+                rotated[16 + j] = CENTROIDS[indices[16 + j]] * d1
+            flat[i * 32: (i + 1) * 32] = _wht_inverse(rotated)
+    else:
+        # New format: d0, d1, m0, m1, qs (with means)
+        for i in range(num_blocks):
+            block = TQ3Block.from_bytes(blocks_data[i * block_bytes: (i + 1) * block_bytes])
+            flat[i * 32: (i + 1) * 32] = dequantize_block_tq3_1s(block)
 
     total_elements = 1
     for s in shape:
