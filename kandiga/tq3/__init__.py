@@ -20,5 +20,6 @@ During inference:
 
 from kandiga.tq3.quantize import quantize_tensor, dequantize_tensor, TQ3Block
 from kandiga.tq3.engine import TQ3Linear
+from kandiga.tq3.loader import load_tq3_model
 
-__all__ = ["quantize_tensor", "dequantize_tensor", "TQ3Block", "TQ3Linear"]
+__all__ = ["quantize_tensor", "dequantize_tensor", "TQ3Block", "TQ3Linear", "load_tq3_model"]

@@ -61,9 +61,15 @@ class DualEngine:
         self._switch_k(self.K_FAST)
         self._brain._log(f"Dual-K: write=K{self.K_FAST}, precise=K{self.K_PRECISE}")
 
-        from mlx_lm import load as mlx_load
-        self._struct_model, self._struct_tokenizer = mlx_load(self.STRUCT_MODEL)
-        self._brain._log(f"2B loaded for structured output")
+        # Try TQ3 weights for the 4B, fall back to original
+        try:
+            from kandiga.tq3.loader import load_tq3_model
+            self._struct_model, self._struct_tokenizer = load_tq3_model(self.STRUCT_MODEL, verbose=True)
+            self._brain._log(f"4B loaded with TQ3 weights")
+        except Exception as e:
+            from mlx_lm import load as mlx_load
+            self._struct_model, self._struct_tokenizer = mlx_load(self.STRUCT_MODEL)
+            self._brain._log(f"4B loaded (original, TQ3 failed: {e})")
         self._ready = True
 
     def _switch_k(self, k: int):
