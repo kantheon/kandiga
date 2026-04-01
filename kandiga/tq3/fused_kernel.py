@@ -112,23 +112,8 @@ def _build_tq3_gemv_kernel(K: int, N: int, block_size: int = 32):
         }}
     }}
 
-    // SIMD reduction
-    acc = simd_sum(acc);
-
-    threadgroup float partial[8];
-    uint simd_group = simdgroup_index_in_threadgroup;
-    if (simd_lane == 0) {{
-        partial[simd_group] = acc;
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (simd_group == 0 && simd_lane < 8) {{
-        acc = partial[simd_lane];
-        acc = simd_sum(acc);
-        if (simd_lane == 0) {{
-            output[row] = half(acc);
-        }}
-    }}
+    // Single thread per row — no reduction needed
+    output[row] = half(acc);
     """
 
     return mx.fast.metal_kernel(
@@ -168,13 +153,16 @@ def tq3_gemv(
 
     kernel = _kernel_cache[key]
 
+    # Pre-rotate input into WHT domain (required for fused TQ3)
+    x_rot = _wht_rotate_input(x)
+
     # Handle batched input
-    if x.ndim == 2:
-        B = x.shape[0]
+    if x_rot.ndim == 2:
+        B = x_rot.shape[0]
         results = []
         for i in range(B):
             out = kernel(
-                inputs=[x[i], packed, scales],
+                inputs=[x_rot[i], packed, scales],
                 grid=(N, 1, 1),
                 threadgroup=(min(256, N), 1, 1),
                 output_shapes=[(N,)],
@@ -183,13 +171,54 @@ def tq3_gemv(
             results.append(out)
         return mx.stack(results)
 
+    # One threadgroup per row, one thread handles ALL blocks in that row
     return kernel(
-        inputs=[x, packed, scales],
+        inputs=[x_rot, packed, scales],
         grid=(N, 1, 1),
-        threadgroup=(min(256, N), 1, 1),
+        threadgroup=(1, 1, 1),
         output_shapes=[(N,)],
         output_dtypes=[mx.float16],
     )[0]
+
+
+def _wht_rotate_input(x: mx.array) -> mx.array:
+    """Pre-rotate input into WHT domain for fused TQ3 dot product.
+
+    Applies sign flips + WHT butterfly + normalize in blocks of 32.
+    """
+    shape = x.shape
+    flat = x.reshape(-1)
+    K = flat.size
+
+    # Pad to multiple of 32
+    pad = (32 - K % 32) % 32
+    if pad:
+        flat = mx.concatenate([flat, mx.zeros(pad, dtype=flat.dtype)])
+
+    # Sign flips
+    signs = mx.array(SIGNS, dtype=mx.float32)
+    blocks = flat.reshape(-1, 32).astype(mx.float32)
+    blocks = blocks * signs[None, :]
+
+    # WHT butterfly (5 stages)
+    for step_exp in range(5):
+        step = 1 << step_exp
+        # This is hard to do efficiently in MLX without a custom kernel
+        # Fall back to numpy for now
+        b_np = np.array(blocks)
+        for i in range(0, 32, step * 2):
+            for j in range(i, i + step):
+                a, b_val = b_np[:, j].copy(), b_np[:, j + step].copy()
+                b_np[:, j] = a + b_val
+                b_np[:, j + step] = a - b_val
+        blocks = mx.array(b_np)
+
+    # Normalize
+    blocks = blocks / math.sqrt(32.0)
+
+    # Flatten and trim padding
+    result = blocks.reshape(-1)[:K]
+    return result.astype(x.dtype).reshape(shape)
 
 
 def pack_tq3_for_metal(weight_data: bytes, shape: tuple, nblocks: int) -> Tuple[mx.array, mx.array]:
