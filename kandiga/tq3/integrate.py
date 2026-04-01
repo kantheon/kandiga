@@ -97,6 +97,17 @@ def convert_model_to_tq3(
     original_bytes = 0
     tq3_bytes = 0
 
+    # Build a map of quantized layers: weight + scales + biases → full matrix
+    # MLX QuantizedLinear stores: weight (packed uint), scales (fp16), biases (fp16)
+    # We need to dequantize via MLX to get the full float matrix
+    quant_groups = {}  # parent_path → {weight, scales, biases}
+    for key, tensor in flat:
+        parts = key.rsplit(".", 1)
+        if len(parts) == 2:
+            parent, attr = parts
+            if attr in ("weight", "scales", "biases"):
+                quant_groups.setdefault(parent, {})[attr] = (key, tensor)
+
     for key, tensor in flat:
         should_skip = (
             tensor.ndim < 2 or
@@ -104,13 +115,40 @@ def convert_model_to_tq3(
             any(p in key.lower() for p in skip_patterns)
         )
 
+        # Skip scales/biases — they're handled with their parent weight
+        if key.endswith(".scales") or key.endswith(".biases"):
+            skipped_layers[key] = tensor
+            skipped_params += tensor.size
+            continue
+
         if should_skip:
             skipped_layers[key] = tensor
             skipped_params += tensor.size
             continue
 
-        # Convert to float32 numpy
-        w = np.array(tensor.astype(mx.float32))
+        # Check if this is a quantized weight that needs dequantization
+        parent_path = key.rsplit(".", 1)[0] if "." in key else ""
+        group = quant_groups.get(parent_path, {})
+
+        if "scales" in group and key.endswith(".weight"):
+            # This is a QuantizedLinear weight — dequantize via MLX first
+            scales_tensor = group["scales"][1]
+            biases_tensor = group.get("biases", (None, None))[1]
+
+            try:
+                w_full = mx.dequantize(tensor, scales_tensor, biases_tensor)
+                mx.eval(w_full)
+                w = np.array(w_full.astype(mx.float32))
+                del w_full  # free GPU memory immediately
+                mx.clear_cache()
+            except Exception as e:
+                if verbose:
+                    print(f"  WARN: dequantize failed for {key}: {e}, using raw")
+                w = np.array(tensor.astype(mx.float32))
+        else:
+            # Regular tensor — convert directly
+            w = np.array(tensor.astype(mx.float32))
+
         orig_size = w.size * 2  # fp16 equivalent
         original_bytes += orig_size
 
