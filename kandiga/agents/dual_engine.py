@@ -9,6 +9,7 @@ Total GPU: ~2.4GB (1.06GB 2B + 1.38GB 35B shared).
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from typing import Any, Dict, Iterator, Optional
@@ -40,7 +41,9 @@ def _set_expert_k(model: nn.Module, k: int) -> int:
 class DualEngine:
     """2B for JSON + 35B K=2/K=4 for writing/verification."""
 
-    STRUCT_MODEL = "mlx-community/Qwen3.5-4B-4bit"
+    # 3-bit is 21% faster than 4-bit, 22% less GPU
+    STRUCT_MODEL_3BIT = os.path.expanduser("~/.kandiga/models/Qwen3.5-4B-3bit")
+    STRUCT_MODEL_4BIT = "mlx-community/Qwen3.5-4B-4bit"
     BRAIN_MODEL = "mlx-community/Qwen3.5-35B-A3B-4bit"
     K_FAST = 4     # K=2 is too degraded for response writing
     K_PRECISE = 4  # same K for everything — proven quality
@@ -61,15 +64,18 @@ class DualEngine:
         self._switch_k(self.K_FAST)
         self._brain._log(f"Dual-K: write=K{self.K_FAST}, precise=K{self.K_PRECISE}")
 
-        # Try TQ3 weights for the 4B, fall back to original
-        try:
-            from kandiga.tq3.loader import load_tq3_model
-            self._struct_model, self._struct_tokenizer = load_tq3_model(self.STRUCT_MODEL, verbose=True)
-            self._brain._log(f"4B loaded with TQ3 weights")
-        except Exception as e:
-            from mlx_lm import load as mlx_load
-            self._struct_model, self._struct_tokenizer = mlx_load(self.STRUCT_MODEL)
-            self._brain._log(f"4B loaded (original, TQ3 failed: {e})")
+        # Load 4B: try 3-bit (faster) → fall back to 4-bit
+        from mlx_lm import load as mlx_load
+        if os.path.isdir(self.STRUCT_MODEL_3BIT):
+            try:
+                self._struct_model, self._struct_tokenizer = mlx_load(self.STRUCT_MODEL_3BIT)
+                self._brain._log(f"4B loaded (3-bit, 21% faster)")
+            except Exception as e:
+                self._struct_model, self._struct_tokenizer = mlx_load(self.STRUCT_MODEL_4BIT)
+                self._brain._log(f"4B loaded (4-bit fallback: {e})")
+        else:
+            self._struct_model, self._struct_tokenizer = mlx_load(self.STRUCT_MODEL_4BIT)
+            self._brain._log(f"4B loaded (4-bit, no 3-bit model found)")
         self._ready = True
 
     def _switch_k(self, k: int):
