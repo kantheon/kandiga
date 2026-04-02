@@ -2,33 +2,25 @@
 
 Giant models. Tiny memory.
 
-Kandiga is an open-source MoE inference engine for Apple Silicon. Run models that normally need 20-224GB of RAM in **2-8GB** — on any Mac. No cloud, no API keys.
+Kandiga is an open-source MoE inference engine + AI agent for Apple Silicon. Run models that normally need 20-224GB of RAM in **2-8GB** — on any Mac. No cloud, no API keys.
+
+## What It Does
+
+- **Inference engine**: Run 35B-397B parameter MoE models in 2-8GB RAM via Selective Expert Materialization (SEM)
+- **AI agent**: Tool calling, web search, file operations, macOS integrations (Calendar, Reminders, Notes, Notifications) — all local
+- **3-bit quantization**: 21% faster and 22% smaller than 4-bit via MLX native `mx.quantize(bits=3)`
+- **Persistent KV cache**: Follow-up turns process only new tokens — turn 50 is as fast as turn 1
+- **TurboQuant**: 3.8x KV cache compression for longer conversations
 
 ## Supported Models
 
-| Model | Parameters | Active | Disk | Kandiga RAM | Min. Mac | Decode | TTFT |
-|-------|-----------|--------|------|-------------|----------|--------|------|
-| Qwen3.5-35B-A3B | 35B | 3B | 20 GB | ~2 GB | 8 GB | 6.5 tok/s | 3-8s |
-| Qwen3.5-122B-A10B | 122B | 10B | 70 GB | ~4 GB | 16 GB | 1.4 tok/s | 7-27s |
-| Qwen3.5-397B-A17B | 397B | 17B | 224 GB | ~8 GB | 24 GB | ~1 tok/s | TBD |
-
-Without Kandiga, these models require their full disk size in RAM. With SEM, only the shared layers load to memory — expert weights stay on disk and are read on demand.
-
-## How it works
-
-MoE models have hundreds of expert sub-networks per layer, but only activate a few per token. Kandiga exploits this sparsity with six techniques:
-
-1. **Selective Expert Materialization (SEM)** — shared layers load to GPU, expert weights stay on disk. Only the 8 router-selected experts are read per token per layer.
-
-2. **Custom Metal GPU kernels** — during prefill (processing your prompt), expert MLP runs entirely on GPU via custom Metal shaders. One dispatch handles ALL experts for ALL tokens — zero Python loop overhead.
-
-3. **CPU NEON decode** — during generation (single token), expert MLP runs on CPU with NEON-vectorized 4-bit dequant. Faster than GPU for single-token due to zero Metal dispatch overhead.
-
-4. **Cross-layer expert speculation** — predicts next layer's expert routing with 77% accuracy. Pre-fetches predicted experts into OS page cache during current layer's compute. Overlaps I/O with computation.
-
-5. **TurboQuant KV compression** — compresses the KV cache from 16-bit to 3-bit (3.8x) using PolarQuant + QJL error correction. Enables longer conversations without running out of memory.
-
-6. **ZMLX fused kernels** — third-party Metal kernel optimizations for attention and norms. +45% decode speed.
+| Model | Parameters | Active | Disk | Kandiga RAM | Decode | Status |
+|-------|-----------|--------|------|-------------|--------|--------|
+| Qwen3.5-4B (3-bit) | 4B | 4B | 1.84 GB | ~1.8 GB | **136 tok/s** | Proven |
+| Qwen3.5-4B (4-bit) | 4B | 4B | 2.4 GB | ~2.4 GB | 112 tok/s | Proven |
+| Qwen3.5-35B-A3B | 35B | 3B | 20 GB | ~2 GB | **6.7 tok/s** | Proven |
+| Qwen3.5-122B-A10B | 122B | 10B | 70 GB | ~4 GB | 1.4 tok/s | Proven |
+| Qwen3.5-27B (3-bit) | 27B | 27B | ~10 GB | ~10 GB | est. 10-13 tok/s | Pending |
 
 ## Install
 
@@ -41,7 +33,7 @@ pip install kandiga[fast]
 
 Requirements: macOS with Apple Silicon (M1/M2/M3/M4), Python 3.10+
 
-## Quick start
+## Quick Start
 
 ```bash
 # One-time setup: choose model, download, prepare expert files
@@ -50,183 +42,155 @@ kandiga setup
 # Interactive chat
 kandiga chat
 
-# Fast mode (K=4 experts instead of 8, ~2x speed)
+# Fast mode (K=4 experts, ~2x speed)
 kandiga chat --fast
+
+# AI agent mode — tools, skills, memory, macOS integrations
+kandiga agent --fast
+
+# Agent with web UI
+kandiga agent --fast --web
 
 # One-shot prompt
 kandiga "What is the capital of France?"
 
-# Start an OpenAI-compatible API server
+# OpenAI-compatible API server
 kandiga serve
 
-# Run benchmarks
+# Benchmarks
 kandiga bench
-
-# Update to latest version
-kandiga update
-
-# View changelog
-kandiga changelog
 ```
-
-## Performance
-
-Measured on M4 Mac Mini (16GB):
-
-| Model | Mode | Decode | TTFT (first turn) | TTFT (follow-up) | RAM |
-|-------|------|--------|-------------------|-------------------|-----|
-| Qwen3.5-35B | K=8 | 3.7 tok/s | 5-15s | **2-4s** | ~2 GB |
-| Qwen3.5-35B | K=4 | 6.3 tok/s | 3-8s | **2-4s** | ~2 GB |
-| Qwen3.5-122B | K=4 | 1.0 tok/s | 11-18s | **11-15s** | ~4 GB |
-
-Key: follow-up TTFT is constant (3-4s) regardless of conversation length thanks to persistent KV cache.
-
-## Persistent KV Cache (Conversation Memory)
-
-The biggest problem with local LLMs: every message re-processes the ENTIRE conversation history. Turn 30 re-reads turns 1-29 — even though the model already read them.
-
-Kandiga solves this with persistent KV cache:
-
-```
-Without persistent cache:
-  Turn 1:  8s    (reads invoice)
-  Turn 5:  25s   (re-reads invoice + 4 turns)
-  Turn 30: 2min+ (re-reads everything)
-
-With persistent cache:
-  Turn 1:  8s    (reads invoice once)
-  Turn 2:  3s    (only reads new question)
-  Turn 5:  3s    (only reads new question)
-  Turn 30: 3s    (only reads new question)
-```
-
-The model reads the conversation once and keeps its understanding in memory. Every follow-up only processes the new message. TTFT stays flat at 3-4 seconds regardless of conversation length.
-
-```python
-from kandiga.engine import KandigaEngine
-
-engine = KandigaEngine()
-engine.load()
-engine.start_session()
-
-# Turn 1: send a document (8s TTFT — processes the document)
-for token in engine.session_generate("Here is an invoice: ..."):
-    print(token, end="")
-
-# Turn 2: follow-up (3s TTFT — document already cached)
-for token in engine.session_generate("What is the most expensive item?"):
-    print(token, end="")
-
-# Turn 30: still 3s TTFT
-for token in engine.session_generate("Summarize everything"):
-    print(token, end="")
-
-engine.end_session()
-```
-
-Combined with TurboQuant (3.8x KV compression), conversations can run for 32K+ tokens before hitting memory limits.
-
-### Save & Resume Sessions
-
-Sessions persist to disk so conversations survive app restarts. Close your laptop, reopen tomorrow, and pick up exactly where you left off — no re-processing.
-
-```python
-# Save conversation state (KV cache + history)
-engine.save_session("~/my_session.npz")   # ~2-10MB compressed
-
-# Later: load and continue instantly
-engine.load_session("~/my_session.npz")   # <0.2s load time
-for token in engine.session_generate("Where were we?"):
-    print(token, end="")  # model remembers everything
-```
-
-The save file includes the full KV cache state for all 40-48 layers (attention + linear), conversation history, and token tracking. Loading restores the model's exact state — no re-reading the conversation.
-
-## GPU Metal Prefill
-
-During prefill (processing your prompt), Kandiga uses custom Metal compute shaders instead of CPU:
-
-- **Phase 1**: Gate + Up projection + SwiGLU activation — one Metal dispatch for ALL experts
-- **Phase 2**: Down projection — one Metal dispatch
-
-This eliminates the Python loop entirely. All expert computation for all tokens happens in two GPU dispatches per layer. Combined with C-level parallel `pread` via GCD, this gives **3-5x faster prefill** compared to the CPU-only path.
-
-```
-Prefill improvement (35B, ~150 tokens):
-  CPU baseline:     24.0s
-  GPU + Python loop: 7.7s
-  GPU Metal kernel:  6.1s  (current)
-```
-
-## KV Cache Compression (TurboQuant)
-
-Compresses the KV cache from 16-bit to 3-bit per element (3.8x reduction) with only 4% quality loss. Based on [Google Research TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/).
-
-| Context Length | Standard (float16) | Kandiga (3-bit) | Compression |
-|---------------|-------------------|-----------------|-------------|
-| 4K tokens | 16.8 MB | 4.5 MB | 3.8x |
-| 8K tokens | 33.6 MB | 8.9 MB | 3.8x |
-| 16K tokens | 67.1 MB | 17.8 MB | 3.8x |
-| 32K tokens | 134 MB | 35.3 MB | 3.8x |
 
 ## Architecture
 
+### Inference Engine (SEM)
+
+MoE models have hundreds of expert sub-networks per layer, but only activate a few per token. Kandiga exploits this sparsity:
+
+1. **Selective Expert Materialization** — shared layers on GPU (~1.4GB), expert weights on SSD. Only router-selected experts loaded per token.
+2. **Custom Metal GPU kernels** — prefill runs expert MLP entirely on GPU. One dispatch, zero Python overhead.
+3. **CPU NEON decode** — single-token expert MLP on CPU with NEON-vectorized 4-bit dequant. Faster than GPU for single tokens (no Metal dispatch overhead).
+4. **Cross-layer speculation** — predicts next layer's experts with 77% accuracy. Pre-fetches into OS page cache during current compute.
+5. **TurboQuant KV compression** — 3.8x compression (16-bit → 3-bit) via PolarQuant + QJL. Enables 32K context on 16GB.
+6. **ZMLX fused kernels** — optimized attention and norms.
+
+### 3-Bit Weight Quantization
+
+MLX's native `mx.quantize(bits=3)` with `quantized_matmul(bits=3)`:
+
+| Metric | 4-bit | 3-bit | Improvement |
+|--------|-------|-------|-------------|
+| Speed | 112 tok/s | **136 tok/s** | **21% faster** |
+| Load time | 3.6s | **0.9s** | **4x faster** |
+| GPU memory | 2,368MB | **1,842MB** | **526MB saved** |
+| Disk | 2.4GB | **1.84GB** | **23% smaller** |
+| Quality | ✓ correct | ✓ correct | Same |
+
+Conversion: one-time `dequant 4-bit → requant 3-bit → save safetensors`. Model saved at `~/.kandiga/models/Qwen3.5-4B-3bit/`.
+
+### Agent System
+
+Kandiga includes a full AI agent with native Qwen3.5 tool calling:
+
+**Architecture:**
+- **4B (3-bit, 136 tok/s)**: tool call JSON generation, route classification
+- **35B K=4 (6.7 tok/s)**: response writing, reasoning via session KV cache
+- **17 tools**: filesystem (read/write/list/search), shell, web search, macOS (Calendar, Reminders, Notes, Notifications, Finder, Contacts, system info, text-to-speech)
+- **Skill engine**: OpenClaw-compatible SKILL.md format
+- **Memory**: MEMORY.md + daily notes + persistent KV cache sessions
+
+**Agent performance (M4 Mac Mini 16GB):**
+
+| Task | Time | Tools Used |
+|------|------|-----------|
+| Hello | 2-6s | — |
+| List files | 15s | list_dir |
+| Read CSV + calculate | 60s | read_file |
+| Create script + run | 70s | write_file, run_shell |
+| Web search + notify | 49s | web_search, notify |
+| Multi-step (5 tools) | 105s | list_dir, read_file ×3, write_file |
+
+10/10 multi-turn test passed. KV cache maintains context across all turns.
+
+## Performance (M4 Mac Mini, 16GB)
+
+| Model | Mode | Decode | TTFT | Follow-up TTFT | RAM |
+|-------|------|--------|------|----------------|-----|
+| Qwen3.5-4B (3-bit) | dense | **136 tok/s** | <1s | <1s | 1.8 GB |
+| Qwen3.5-35B | K=8 | 3.7 tok/s | 5-15s | **2-4s** | ~2 GB |
+| Qwen3.5-35B | K=4 | **6.7 tok/s** | 3-8s | **2-4s** | ~2 GB |
+| Qwen3.5-122B | K=4 | 1.0 tok/s | 11-18s | **11-15s** | ~4 GB |
+
+Follow-up TTFT is constant regardless of conversation length thanks to persistent KV cache.
+
+## Persistent KV Cache
+
 ```
-User prompt
-    |
-    v
-[Tokenizer + Chat Template]
-    |
-    v
-[MLX Forward Pass — per layer:]
-    |
-    +---> GPU: Attention + Norms + Router (MLX lazy eval)
-    |
-    +---> Prefill (multi-token):
-    |     GPU Metal kernel: batch pread + dequant + matmul + SiLU
-    |     (one dispatch for ALL experts, ALL tokens)
-    |
-    +---> Decode (single-token):
-    |     CPU NEON: pread + 4-bit dequant matvec + GCD parallel
-    |     (faster than GPU for single vectors)
-    |
-    +---> Cross-layer speculation: predict next layer's experts
-    |     Background prefetch into OS page cache
-    |
-    v
-[Token Output — streaming]
+Without persistent cache:       With persistent cache:
+  Turn 1:  8s (reads document)     Turn 1:  8s (reads once)
+  Turn 5:  25s (re-reads all)      Turn 5:  3s (new tokens only)
+  Turn 30: 2min+ (re-reads all)    Turn 30: 3s (new tokens only)
 ```
 
-## API Server
-
-OpenAI-compatible HTTP API:
-
-```bash
-kandiga serve --port 8340
-```
-
+Save/load sessions to disk:
 ```python
-import openai
-
-client = openai.OpenAI(base_url="http://localhost:8340/v1", api_key="unused")
-response = client.chat.completions.create(
-    model="mlx-community/Qwen3.5-35B-A3B-4bit",
-    messages=[{"role": "user", "content": "Hello!"}],
-    stream=True,
-)
-for chunk in response:
-    print(chunk.choices[0].delta.content or "", end="")
+engine.save_session("~/session.npz")   # Save KV cache state
+engine.load_session("~/session.npz")   # Resume instantly (<0.1s)
 ```
 
-## Key Technical Details
+## TQ3 Weight Quantization
 
-- **Expert binary format**: packed 4-bit uint32 weights with bfloat16 scales/biases, 4096-byte header per layer file. Expert dimensions auto-detected from header.
-- **Two C libraries**: `libkandiga_cpu_expert.dylib` (35B, hardcoded dims) and `libkandiga_cpu_expert_lg.dylib` (122B/397B, dynamic dims from header)
-- **Custom Metal shaders**: `attention.metal` (19 kernels), `expert_mlp.metal`, `moe_block.metal` — compiled at runtime
-- **Cross-layer speculation**: 77% prediction accuracy using router gate CPU matmul (~0.05ms)
-- **Layer skipping**: large models skip routed experts on every 3rd layer (shared expert only). Reduces syncs by 33% with quality preserved.
-- **Thinking mode disabled**: `enable_thinking=False` in chat template to avoid wasted tokens
-- **Auto-update checker**: background check against PyPI, cached 24h
+TQ3 (TurboQuant 3-bit) applies Walsh-Hadamard Transform rotation before quantization for better quality:
+
+- **Algorithm**: WHT rotation → Lloyd-Max 8-level codebook → 3-bit packing
+- **Quality**: 0.990 cosine similarity per layer (proven across all 32 layers)
+- **Metal kernel**: Fused GEMV with SIMD WHT butterfly (cosine 1.0, 62% memory savings)
+- **Status**: Algorithm proven, MLX native 3-bit is faster for production use
+
+For production: use `mx.quantize(bits=3)` (MLX native). TQ3 WHT rotation is for research/future optimization.
+
+## File Structure
+
+```
+kandiga/
+├── engine.py              # SEM inference engine (1387 lines)
+├── kv_compress.py         # TurboQuant KV cache compression
+├── speculative.py         # Dual-model speculative decoding
+├── cli.py                 # CLI interface
+├── chat.py                # Interactive chat (Rich terminal)
+├── serve.py               # OpenAI-compatible API server
+├── agents/                # AI agent layer
+│   ├── agent_loop.py      # Native Qwen3.5 tool-calling loop
+│   ├── agent_chat.py      # Agent interactive chat
+│   ├── agent_serve.py     # Agent web server + UI
+│   ├── dual_engine.py     # 4B + 35B dual-model engine
+│   ├── pipeline.py        # Agent pipeline (routing, tools, verification)
+│   ├── tools.py           # 17 tools (filesystem, shell, web, macOS)
+│   ├── macos.py           # macOS native integrations via osascript
+│   ├── skills.py          # OpenClaw-compatible SKILL.md engine
+│   ├── memory.py          # Persistent memory (MEMORY.md + daily notes)
+│   ├── cloud.py           # Cloud escalation (Kimi/Claude/OpenAI)
+│   ├── protocol.py        # Typed dataclasses (ToolCall, ToolResult, AgentResult)
+│   └── json_repair.py     # 5-strategy JSON repair (never crashes)
+├── tq3/                   # TQ3 weight quantization
+│   ├── quantize.py        # WHT + Lloyd-Max + packing (vectorized)
+│   ├── engine.py          # TQ3Linear layer + save/load
+│   ├── fused_kernel.py    # Metal GEMV kernel (SIMD WHT)
+│   ├── integrate.py       # Model conversion pipeline
+│   ├── loader.py          # TQ3 model loader
+│   ├── convert_experts.py # MoE expert conversion
+│   ├── mlx_patch.py       # MLX model patching
+│   └── tq3_metal.metal    # Metal compute shader
+├── metal/                 # C/Metal inference (6,600+ lines)
+│   ├── kandiga_cpu_expert.m    # NEON expert MLP (35B)
+│   ├── kandiga_cpu_expert_lg.m # NEON expert MLP (122B/397B)
+│   ├── attention.metal         # GPU attention kernels
+│   ├── expert_mlp.metal        # GPU expert MLP kernels
+│   └── moe_block.metal         # GPU MoE block kernels
+├── static/
+│   └── agent.html         # Agent web UI
+└── tools/                 # Optional tool integrations
+```
 
 ## Development
 
@@ -234,14 +198,9 @@ for chunk in response:
 git clone https://github.com/kantheon/kandiga.git
 cd kandiga
 pip install -e ".[serve,fast]"
-
-# Build CPU expert libraries
-cd kandiga/metal && make && cd ../..
-
-# Run tests
 pytest tests/ -v
 ```
 
 ## License
 
-MIT — Built by [Kantheon](https://kantheon.com)
+MIT
