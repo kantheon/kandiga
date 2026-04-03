@@ -82,6 +82,14 @@ def _parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
     return {"name": name, "args": args}
 
 
+def _needs_multi_tool(query: str) -> bool:
+    """Check if query likely needs multiple tool calls (multi-step)."""
+    q = query.lower()
+    multi_signals = ["and then", "then ", "after that", "also ", "and also",
+                     "first ", "next ", "finally ", " and "]
+    return any(s in q for s in multi_signals)
+
+
 def _strip_thinking(text: str) -> str:
     text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
     if '</think>' in text:
@@ -377,6 +385,12 @@ class AgentLoop:
 
             status = "OK" if tr.success else "FAILED"
             self.on_stage("result", f"{name}: {status}")
+
+            # For single successful tool calls on simple queries, return immediately
+            # Don't let the model generate again — it will just loop
+            if tr.success and iteration == 1 and not _needs_multi_tool(query):
+                response = self._build_response(query, raw, all_results)
+                return self._finish(query, response, all_results, t_start, flags)
 
             # Feed back in native format with explicit status
             messages.append({"role": "assistant", "content": raw})
