@@ -18,9 +18,11 @@ Kandiga is an open-source MoE inference engine + AI agent for Apple Silicon. Run
 |-------|-----------|--------|------|-------------|--------|--------|
 | Qwen3.5-4B (3-bit) | 4B | 4B | 1.84 GB | ~1.8 GB | **136 tok/s** | Proven |
 | Qwen3.5-4B (4-bit) | 4B | 4B | 2.4 GB | ~2.4 GB | 112 tok/s | Proven |
-| Qwen3.5-35B-A3B | 35B | 3B | 20 GB | ~2 GB | **6.7 tok/s** | Proven |
-| Qwen3.5-122B-A10B | 122B | 10B | 70 GB | ~4 GB | 1.4 tok/s | Proven |
-| Qwen3.5-27B (3-bit) | 27B | 27B | ~10 GB | ~10 GB | est. 10-13 tok/s | Pending |
+| Qwen3.5-35B-A3B (full 3-bit) | 35B | 3B | 20 GB | **~1 GB** | **8.1 tok/s** | Proven |
+| Qwen3.5-35B-A3B (4-bit) | 35B | 3B | 20 GB | ~1.4 GB | 6.7 tok/s | Proven |
+| Qwen3.5-122B-A10B (full 3-bit) | 122B | 10B | 70 GB | **~2.7 GB** | **2.2 tok/s** | Proven |
+| Qwen3.5-122B-A10B (4-bit) | 122B | 10B | 70 GB | ~3.5 GB | 1.3 tok/s | Proven |
+| Qwen3.5-397B-A17B (full 3-bit) | 397B | 17B | 224 GB | est. ~5 GB | est. 0.3-0.5 tok/s | Pending |
 
 ## Install
 
@@ -88,6 +90,25 @@ MLX's native `mx.quantize(bits=3)` with `quantized_matmul(bits=3)`:
 
 Conversion: one-time `dequant 4-bit → requant 3-bit → save safetensors`. Model saved at `~/.kandiga/models/Qwen3.5-4B-3bit/`.
 
+**Full 3-bit MoE** — shared layers on GPU + expert weights on SSD, both at 3-bit:
+
+| Model | 4-bit | Full 3-bit | Speed gain | GPU savings |
+|-------|-------|------------|------------|-------------|
+| 35B-A3B | 6.7 tok/s, 1.4 GB | **8.1 tok/s, 1.0 GB** | **+21%** | **-22%** |
+| 122B-A10B | 1.3 tok/s, 3.5 GB | **2.2 tok/s, 2.7 GB** | **+69%** | **-22%** |
+
+Conversion (one-time):
+```bash
+# Shared layers (GPU): dequant 4-bit → requant 3-bit → save safetensors
+python scripts/convert_3bit.py mlx-community/Qwen3.5-35B-A3B-4bit \
+    ~/.kandiga/models/Qwen3.5-35B-A3B-3bit-shared
+
+# Expert weights (SSD): repack binary files at 3-bit (22% smaller = 22% less I/O)
+python scripts/repack_experts_3bit.py ~/.kandiga/experts/Qwen3.5-35B-A3B-4bit/packed
+```
+
+Both auto-detected on engine startup. NEON-vectorized 3-bit dequant kernel matches MLX's bit layout.
+
 ### Agent System
 
 Kandiga includes a full AI agent with native Qwen3.5 tool calling:
@@ -117,9 +138,10 @@ Kandiga includes a full AI agent with native Qwen3.5 tool calling:
 | Model | Mode | Decode | TTFT | Follow-up TTFT | RAM |
 |-------|------|--------|------|----------------|-----|
 | Qwen3.5-4B (3-bit) | dense | **136 tok/s** | <1s | <1s | 1.8 GB |
-| Qwen3.5-35B | K=8 | 3.7 tok/s | 5-15s | **2-4s** | ~2 GB |
-| Qwen3.5-35B | K=4 | **6.7 tok/s** | 3-8s | **2-4s** | ~2 GB |
-| Qwen3.5-122B | K=4 | 1.0 tok/s | 11-18s | **11-15s** | ~4 GB |
+| Qwen3.5-35B (full 3-bit) | K=4 | **8.1 tok/s** | 3-8s | **2-4s** | ~1 GB |
+| Qwen3.5-35B (4-bit) | K=4 | 6.7 tok/s | 3-8s | **2-4s** | ~1.4 GB |
+| Qwen3.5-122B (full 3-bit) | K=4 | **2.2 tok/s** | 11-18s | **11-15s** | ~2.7 GB |
+| Qwen3.5-122B (4-bit) | K=4 | 1.3 tok/s | 11-18s | **11-15s** | ~3.5 GB |
 
 Follow-up TTFT is constant regardless of conversation length thanks to persistent KV cache.
 

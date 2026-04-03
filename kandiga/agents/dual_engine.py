@@ -1,10 +1,10 @@
-"""Tri-mode engine — 2B (JSON) + 35B K=2 (writing) + 35B K=4 (verification).
+"""Multi-model engine — 4B + 35B MoE + 122B MoE (optional).
 
-2B (45 tok/s, 0.8s):  tool JSON, route classification, structured output
-35B K=2 (9-10 tok/s): response writing, summaries, content
-35B K=4 (5 tok/s):    verification when tools fail (runs once)
+4B (136 tok/s):       tool JSON, route classification, simple answers
+35B K=4 (8.1 tok/s):  response writing, moderate reasoning, session KV cache
+122B K=4 (2.2 tok/s): complex coding, deep analysis (lazy-loaded on demand)
 
-Total GPU: ~2.4GB (1.06GB 2B + 1.38GB 35B shared).
+GPU: 4B=1.8GB + 35B=1.0GB + 122B=2.7GB (lazy) = 5.5GB on 16GB Mac.
 """
 
 from __future__ import annotations
@@ -195,12 +195,87 @@ class DualEngine:
         s["k_fast"] = self.K_FAST
         s["k_precise"] = self.K_PRECISE
         s["current_k"] = self._current_k
-        s["struct_model"] = self.STRUCT_MODEL
+        s["struct_model"] = self.STRUCT_MODEL_3BIT if os.path.isdir(self.STRUCT_MODEL_3BIT) else self.STRUCT_MODEL_4BIT
         return s
 
     def __del__(self):
         if hasattr(self, '_brain'):
             del self._brain
+
+
+class TriEngine(DualEngine):
+    """4B + 35B + 122B. The 122B is lazy-loaded on first HEAVY request."""
+
+    HEAVY_MODEL = "mlx-community/Qwen3.5-122B-A10B-4bit"
+
+    def __init__(self, fast_mode: bool = True, log_memory: bool = False):
+        super().__init__(fast_mode=fast_mode, log_memory=log_memory)
+        self._heavy: KandigaEngine | None = None
+        self._heavy_ready = False
+
+    def _ensure_heavy(self):
+        """Lazy-load the 122B model on first use."""
+        if self._heavy_ready:
+            return
+        self._brain._log("Loading 122B (first HEAVY request)...")
+        self._heavy = KandigaEngine(
+            model_path=self.HEAVY_MODEL, fast_mode=True, log_memory=self._brain._log_memory,
+        )
+        self._heavy.load()
+        self._heavy_ready = True
+        self._brain._log("122B ready")
+
+    def generate_heavy(self, system: str, user: str,
+                       max_tokens: int = 4096, temp: float = 0.0) -> str:
+        """122B — complex coding, deep analysis. ~2.2 tok/s."""
+        if not self._ready:
+            self.load()
+        self._ensure_heavy()
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        try:
+            formatted = self._heavy._tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        except TypeError:
+            formatted = self._heavy._tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True)
+        return self._heavy.generate(formatted, max_tokens=max_tokens, temp=temp, stream=False)
+
+    def generate_heavy_stream(self, system: str, user: str,
+                              max_tokens: int = 4096, temp: float = 0.0):
+        """122B streaming."""
+        if not self._ready:
+            self.load()
+        self._ensure_heavy()
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        try:
+            formatted = self._heavy._tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        except TypeError:
+            formatted = self._heavy._tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True)
+        for token in self._heavy.generate(formatted, max_tokens=max_tokens, temp=temp, stream=True):
+            yield token
+
+    @property
+    def has_heavy(self) -> bool:
+        return self._heavy_ready
+
+    @property
+    def heavy(self) -> KandigaEngine | None:
+        return self._heavy
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        s = super().stats
+        s["tri_engine"] = True
+        s["heavy_model"] = self.HEAVY_MODEL
+        s["heavy_loaded"] = self._heavy_ready
+        return s
+
+    def __del__(self):
+        if hasattr(self, '_heavy') and self._heavy:
+            del self._heavy
+        super().__del__()
 
 
 def _strip_thinking(text: str) -> str:

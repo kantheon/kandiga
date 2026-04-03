@@ -92,14 +92,58 @@ def _strip_thinking(text: str) -> str:
 StageCallback = Callable[[str, str], None]
 
 
+class LoopGuard:
+    """Prevents infinite agent loops — repeated calls, no progress, budget exhaustion."""
+
+    def __init__(self, max_steps: int = 12, max_repeat: int = 3, max_flat: int = 4):
+        self.max_steps = max_steps
+        self.max_repeat = max_repeat
+        self.max_flat = max_flat
+        self.steps = 0
+        self.flat_steps = 0
+        self.seen: Dict[str, int] = {}
+
+    def on_step(self) -> Optional[str]:
+        self.steps += 1
+        if self.steps > self.max_steps:
+            return "max_steps_reached"
+        return None
+
+    def on_tool_call(self, name: str, args: Dict) -> Optional[str]:
+        sig = f"{name}:{json.dumps(args, sort_keys=True)}"
+        self.seen[sig] = self.seen.get(sig, 0) + 1
+        if self.seen[sig] >= self.max_repeat:
+            return f"loop_detected:repeated_{name}"
+        return None
+
+    def on_progress(self, has_new: bool) -> Optional[str]:
+        self.flat_steps = 0 if has_new else self.flat_steps + 1
+        if self.flat_steps >= self.max_flat:
+            return "loop_detected:no_progress"
+        return None
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.max_steps - self.steps)
+
+
 class AgentLoop:
-    """Native Qwen3.5 tool-calling loop using the model's trained format."""
+    """Native Qwen3.5 tool-calling loop using the model's trained format.
+
+    Production-quality features:
+    - Stop generation after first </tool_call> (no repeated calls)
+    - LoopGuard prevents infinite loops (repeated calls, no progress)
+    - Budget warnings injected when iterations are running low
+    - Tool results fed back in native format for multi-turn
+    - Context compaction when conversation grows too long
+    - 35B synthesis for complex results, 4B skip for simple ones
+    """
 
     def __init__(
         self,
         engine,
         registry: Optional[ToolRegistry] = None,
-        max_iterations: int = 10,
+        max_iterations: int = 12,
         on_stage: Optional[StageCallback] = None,
     ):
         self.engine = engine
@@ -136,28 +180,42 @@ class AgentLoop:
             brain.end_session()
             self._session_active = False
 
-    def _format_and_generate(self, messages: List[Dict], max_tokens: int = 800) -> str:
-        """Format messages with native tool template and generate."""
+    def _format_and_generate(self, messages: List[Dict], max_tokens: int = 150) -> str:
+        """Format messages with native tool template and generate.
+
+        Stops generation after first </tool_call> to prevent
+        repeated calls and false positives after direct answers.
+        """
         try:
             formatted = self._tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
                 tools=self._tool_defs, enable_thinking=False,
             )
         except TypeError:
-            # Fallback without tools parameter
             formatted = self._tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
             )
 
         if self._dual:
-            # Use the 4B model for tool decisions
-            from mlx_lm import generate as mlx_generate
+            from mlx_lm import stream_generate
             from mlx_lm.generate import make_sampler
-            return mlx_generate(
+            # Stream and stop at first </tool_call> or </function>
+            result = ""
+            for resp in stream_generate(
                 self.engine._struct_model, self._tokenizer,
                 prompt=formatted, max_tokens=max_tokens,
-                sampler=make_sampler(temp=0.0), verbose=False,
-            )
+                sampler=make_sampler(temp=0.0),
+            ):
+                result += resp.text
+                # Stop after first complete tool call
+                if "</tool_call>" in result:
+                    # Keep everything up to and including </tool_call>
+                    idx = result.index("</tool_call>") + len("</tool_call>")
+                    result = result[:idx]
+                    break
+                if resp.finish_reason:
+                    break
+            return result
         else:
             return self.engine.generate(formatted, max_tokens=max_tokens, temp=0.0, stream=False)
 
@@ -227,23 +285,24 @@ class AgentLoop:
         return fixed.strip()
 
     def run(self, query: str, context: str = "") -> AgentResult:
-        """Run the native tool-calling loop."""
+        """Run the native tool-calling loop with production-quality guardrails."""
         t_start = time.time()
         query = query.replace("~/", f"{_HOME}/").replace("~ ", f"{_HOME} ")
+        guard = LoopGuard(max_steps=self.max_iterations)
+        flags: List[str] = []
 
-        # Build initial messages
+        # Build system prompt
         system_content = (
             f"You are Kandiga, a local AI agent on the user's Mac. "
             f"Home directory: {_HOME}. Always use full absolute paths. "
-            f"Use tools to complete tasks. Never say 'I cannot'.\n"
-            f"Shell tips: use 'ls -lhS' to sort by size, 'head -N' to limit output, "
-            f"'grep -r' to search in files, 'wc -l' to count lines, "
-            f"'du -sh' for directory sizes, 'python3' not 'python'."
+            f"Use tools when the user's request requires accessing files, running commands, "
+            f"searching the web, or sending notifications. "
+            f"For general knowledge, math, creative writing, and conversation, respond directly. "
+            f"If a tool returns an error, try a different approach. "
+            f"When the task is complete, respond with your final answer (no tool_call tags)."
         )
         if context:
             system_content += f"\n\nContext: {context}"
-
-        # Inject recent conversation context so follow-ups work
         if self._recent_paths:
             system_content += f"\n\nRecent files used: {', '.join(self._recent_paths[-5:])}"
         if self._last_query and self._last_response:
@@ -255,12 +314,17 @@ class AgentLoop:
         ]
 
         all_results: List[ToolResult] = []
-        seen_calls: set = set()
 
         for iteration in range(1, self.max_iterations + 1):
-            self.on_stage("step", f"Step {iteration}...")
+            # LoopGuard: check step limit
+            stop = guard.on_step()
+            if stop:
+                flags.append(stop)
+                break
 
-            raw = self._format_and_generate(messages, max_tokens=300)
+            self.on_stage("step", f"Step {iteration}/{self.max_iterations}")
+
+            raw = self._format_and_generate(messages)
             raw = _strip_thinking(raw)
 
             # Parse tool call
@@ -268,88 +332,24 @@ class AgentLoop:
 
             if not tool_call:
                 # No tool call — model is giving final answer
-                if all_results:
-                    tool_summary = "\n".join(
-                        f"[{tr.tool}] {'OK' if tr.success else 'FAIL'}: "
-                        f"{str(tr.output)[:300] if tr.output else tr.error or ''}"
-                        for tr in all_results
-                    )
-
-                    # Speed optimization: skip 35B for simple single-tool results
-                    # Use 35B when: multiple tools, failures, or query needs reasoning
-                    q_lower = query.lower()
-                    needs_reasoning = any(w in q_lower for w in [
-                        "total", "sum", "calculate", "most", "least", "biggest", "smallest",
-                        "compare", "analyze", "explain", "summarize", "which", "how much",
-                        "how many", "average", "best", "worst", "find", "expensive", "cheap",
-                    ])
-
-                    if len(all_results) == 1 and all_results[0].success and not needs_reasoning:
-                        tr = all_results[0]
-                        output = str(tr.output) if tr.output else ""
-                        if tr.tool in ("list_dir", "search_files"):
-                            response = f"Contents of the directory:\n{output}"
-                        elif tr.tool == "read_file":
-                            response = f"File contents:\n{output[:2000]}"
-                        elif tr.tool == "run_shell":
-                            response = f"Command output:\n{output[:2000]}"
-                        elif tr.tool == "write_file":
-                            response = f"File written successfully. {output}"
-                        elif tr.tool == "notify":
-                            response = "Notification sent."
-                        elif tr.tool == "web_search":
-                            # Web search needs 35B to summarize
-                            self.on_stage("write", "Summarizing (35B)...")
-                            response = self._generate_response(query, tool_summary)
-                        else:
-                            response = output or "Done."
-                    else:
-                        # Multiple tools or failures — 35B synthesizes
-                        self.on_stage("write", "Writing response (35B)...")
-                        response = self._generate_response(query, tool_summary)
-                else:
-                    # Clean up tags from response
-                    response = re.sub(r'</?(?:tool_call|function|parameter)[^>]*>', '', raw).strip()
-                    if not response:
-                        response = raw
-
-                duration = int((time.time() - t_start) * 1000)
-                conf = 0.90 if all_results and all(tr.success for tr in all_results) else (0.50 if all_results else 0.85)
-
-                # Track for follow-ups
-                self._last_query = query
-                self._last_response = response[:300]
-                for tr in all_results:
-                    for v in tr.args.values():
-                        if isinstance(v, str) and '/' in v:
-                            if v not in self._recent_paths:
-                                self._recent_paths.append(v)
-
-                self.on_stage("done", f"conf={conf:.2f} ({len(all_results)} tools)")
-                return AgentResult(
-                    content=response, confidence=conf, verified=conf >= 0.7,
-                    route="agent", tool_results=all_results, duration_ms=duration,
-                )
+                response = self._build_response(query, raw, all_results)
+                return self._finish(query, response, all_results, t_start, flags)
 
             # Execute tool
             name = tool_call["name"]
             args = tool_call["args"]
 
-            call_key = f"{name}:{json.dumps(args, sort_keys=True)}"
-            if call_key in seen_calls:
-                messages.append({"role": "user", "content": "<tool_response>\nAlready executed. Result is above.\n</tool_response>"})
-                continue
-            seen_calls.add(call_key)
+            # LoopGuard: check for repeated calls
+            dup = guard.on_tool_call(name, args)
+            if dup:
+                flags.append(dup)
+                self.on_stage("guard", f"Loop detected: repeated {name}")
+                response = self._build_response(query, "", all_results)
+                return self._finish(query, response, all_results, t_start, flags)
 
             if not self.registry.has_tool(name):
-                messages.append({
-                    "role": "assistant",
-                    "content": raw,
-                })
-                messages.append({
-                    "role": "user",
-                    "content": f"<tool_response>\nError: unknown tool '{name}'. Available: {', '.join(sorted(self.registry.tool_names))}\n</tool_response>",
-                })
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({"role": "user", "content": f"<tool_response>\nError: unknown tool '{name}'. Available: {', '.join(sorted(self.registry.tool_names))}\n</tool_response>"})
                 continue
 
             self.on_stage("tool", f"{name}({json.dumps(args)[:60]})")
@@ -357,9 +357,16 @@ class AgentLoop:
             tr = self.registry.execute(tc)
             all_results.append(tr)
 
-            status = "OK" if tr.success else "FAILED"
+            # LoopGuard: check progress
+            has_new = tr.success and tr.output and len(str(tr.output)) > 10
+            prog = guard.on_progress(has_new)
+            if prog:
+                flags.append(prog)
+                self.on_stage("guard", "No progress detected")
+                response = self._build_response(query, "", all_results)
+                return self._finish(query, response, all_results, t_start, flags)
+
             output = str(tr.output) if tr.output else (tr.error or "")
-            # Smart truncation — keep first and last lines if too long
             if len(output) > 2000:
                 lines = output.split('\n')
                 if len(lines) > 20:
@@ -367,26 +374,89 @@ class AgentLoop:
                     output = '\n'.join(kept)
                 else:
                     output = output[:2000]
+
+            status = "OK" if tr.success else "FAILED"
             self.on_stage("result", f"{name}: {status}")
 
-            # Feed back in the native format
+            # Feed back in native format
             messages.append({"role": "assistant", "content": raw})
             messages.append({"role": "user", "content": f"<tool_response>\n{output}\n</tool_response>"})
 
-        # Max iterations
-        duration = int((time.time() - t_start) * 1000)
-        if all_results:
-            tool_summary = "\n".join(
-                f"[{tr.tool}] {'OK' if tr.success else 'FAIL'}: "
-                f"{str(tr.output)[:300] if tr.output else tr.error or ''}"
-                for tr in all_results
-            )
-            self.on_stage("write", "Writing response...")
-            response = self._generate_response(query, tool_summary)
-        else:
-            response = "Could not complete task within iteration limit."
+            # Budget warning when running low
+            if guard.remaining <= 2:
+                messages[-1]["content"] += f"\n[BUDGET WARNING: {guard.remaining} iterations remaining. Wrap up.]"
 
+        # Max iterations exhausted
+        flags.append("max_iterations")
+        response = self._build_response(query, "", all_results)
+        return self._finish(query, response, all_results, t_start, flags)
+
+    def _build_response(self, query: str, raw: str, all_results: List[ToolResult]) -> str:
+        """Build the final response — skip 35B for simple results."""
+        if not all_results:
+            # No tools called — clean up tags from direct answer
+            response = re.sub(r'</?(?:tool_call|function|parameter)[^>]*>', '', raw).strip()
+            return response or raw
+
+        tool_summary = "\n".join(
+            f"[{tr.tool}] {'OK' if tr.success else 'FAIL'}: "
+            f"{str(tr.output)[:300] if tr.output else tr.error or ''}"
+            for tr in all_results
+        )
+
+        # Skip 35B for simple single-tool results
+        q_lower = query.lower()
+        needs_reasoning = any(w in q_lower for w in [
+            "total", "sum", "calculate", "most", "least", "biggest", "smallest",
+            "compare", "analyze", "explain", "summarize", "which", "how much",
+            "how many", "average", "best", "worst", "expensive", "cheap",
+        ])
+
+        if len(all_results) == 1 and all_results[0].success and not needs_reasoning:
+            tr = all_results[0]
+            output = str(tr.output) if tr.output else ""
+            if tr.tool in ("list_dir", "search_files"):
+                return f"Contents:\n{output}"
+            elif tr.tool == "read_file":
+                return f"File contents:\n{output[:2000]}"
+            elif tr.tool == "run_shell":
+                return f"Output:\n{output[:2000]}"
+            elif tr.tool == "write_file":
+                return f"File written successfully. {output}"
+            elif tr.tool == "notify":
+                return output or "Notification sent."
+            elif tr.tool == "web_search":
+                self.on_stage("write", "Summarizing (35B)...")
+                return self._generate_response(query, tool_summary)
+            return output or "Done."
+
+        # Multiple tools or failures — 35B synthesizes
+        self.on_stage("write", "Writing response (35B)...")
+        return self._generate_response(query, tool_summary)
+
+    def _finish(self, query: str, response: str, all_results: List[ToolResult],
+                t_start: float, flags: List[str]) -> AgentResult:
+        """Finalize the result with confidence scoring and tracking."""
+        duration = int((time.time() - t_start) * 1000)
+
+        if all_results and all(tr.success for tr in all_results):
+            conf = 0.90
+        elif all_results:
+            conf = 0.50
+        else:
+            conf = 0.85
+
+        # Track for follow-ups
+        self._last_query = query
+        self._last_response = response[:300]
+        for tr in all_results:
+            for v in tr.args.values():
+                if isinstance(v, str) and '/' in v:
+                    if v not in self._recent_paths:
+                        self._recent_paths.append(v)
+
+        self.on_stage("done", f"conf={conf:.2f} ({len(all_results)} tools)")
         return AgentResult(
-            content=response, confidence=0.50, route="agent",
-            tool_results=all_results, flags=["max iterations"], duration_ms=duration,
+            content=response, confidence=conf, verified=conf >= 0.7,
+            route="agent", tool_results=all_results, flags=flags, duration_ms=duration,
         )

@@ -178,11 +178,11 @@ def run_shell(command: str, background: bool = False) -> str:
 
 def default_tools() -> ToolRegistry:
     reg = ToolRegistry()
-    reg.register("read_file", "Read a file", {"path": "str"}, read_file)
-    reg.register("write_file", "Write a file", {"path": "str", "content": "str"}, write_file)
-    reg.register("list_dir", "List directory", {"path": "str"}, list_dir)
-    reg.register("search_files", "Search for files", {"pattern": "str", "path": "str"}, search_files)
-    reg.register("run_shell", "Run a shell command", {"command": "str"}, run_shell)
+    reg.register("read_file", "Read the contents of a file at a given path", {"path": "str"}, read_file)
+    reg.register("write_file", "Write or create a file with the given content", {"path": "str", "content": "str"}, write_file)
+    reg.register("list_dir", "List files and folders in a directory", {"path": "str"}, list_dir)
+    reg.register("search_files", "Search for files matching a glob pattern", {"pattern": "str", "path": "str"}, search_files)
+    reg.register("run_shell", "Run any shell command (ls, df, date, rm, find, python3, etc) and return output. Use this for system info, disk space, time, deleting files, running scripts, or any terminal command", {"command": "str"}, run_shell)
     # Web search — try ddgs (new name) then duckduckgo_search (old name)
     _ddgs_cls = None
     try:
@@ -257,6 +257,6 @@ def default_tools() -> ToolRegistry:
             except Exception as e:
                 return f"Error reading {url}: {e}"
 
-        reg.register("web_search", "Search the web and read top pages", {"query": "str"}, web_search)
-        reg.register("read_webpage", "Read a specific webpage URL", {"url": "str"}, read_webpage)
+        reg.register("web_search", "Search the web for current information like weather, news, prices, sports scores, or any real-time data", {"query": "str"}, web_search)
+        reg.register("read_webpage", "Fetch and read the text content of a specific URL", {"url": "str"}, read_webpage)
     return reg

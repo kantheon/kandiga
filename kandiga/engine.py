@@ -717,7 +717,10 @@ class _CPUSwitchGLU(nn.Module):
         if num_tokens == 1:
             self._predict_and_prefetch(x_np)
 
-        if actual_tokens > 1 and self._expert_size > 0:
+        # GPU prefill only works with 4-bit experts (Metal kernel is 4-bit only)
+        # 3-bit experts detected by size: 1344 KB (35B) or similar
+        is_4bit_experts = self._expert_size in (1769472, 5308416)  # 35B, 122B 4-bit sizes
+        if actual_tokens > 1 and self._expert_size > 0 and is_4bit_experts:
             # PREFILL: GPU batched expert MLP (43x faster than CPU sequential)
             # Load each unique expert, dequantize on GPU, batched matmul
             self._gpu_prefill_experts(x_flat, idx_i32, actual_tokens, K, out_np)
@@ -765,7 +768,7 @@ class KandigaEngine:
 
     DEFAULT_MODEL = "mlx-community/Qwen3.5-35B-A3B-4bit"
     CACHE_DIR = os.path.expanduser("~/.kandiga/experts")
-    EXPERT_PATTERN = "switch_mlp"
+    EXPERT_PATTERN = "switch_mlp"  # Qwen3.5; Gemma4 uses "switch_glu"
 
     def __init__(
         self,
@@ -812,9 +815,14 @@ class KandigaEngine:
         if self._ready:
             return
 
-        # Step 1: Verify packed binary files exist
+        # Step 1: Verify packed binary files exist (prefer 3-bit over 4-bit)
         cache_dir = self._model_cache_dir()
-        packed_dir = os.path.join(cache_dir, "packed")
+        packed_dir_3bit = os.path.join(cache_dir, "packed_3bit")
+        packed_dir_4bit = os.path.join(cache_dir, "packed")
+        if os.path.isdir(packed_dir_3bit):
+            packed_dir = packed_dir_3bit
+        else:
+            packed_dir = packed_dir_4bit
         is_dense = not os.path.isdir(packed_dir)
 
         if is_dense:
@@ -829,6 +837,14 @@ class KandigaEngine:
         # Step 2: Load model with lazy weights (MoE path — unchanged)
         self._model, self._tokenizer = load(self.model_path, lazy=True)
         self._log("Model structure loaded (lazy)")
+
+        # Step 2b: Auto-detect expert pattern (Qwen=switch_mlp, Gemma4=switch_glu)
+        flat_keys = [k for k, _ in tree_flatten(self._model.parameters())]
+        if any("switch_glu" in k for k in flat_keys):
+            self.EXPERT_PATTERN = "switch_glu"
+            self._log("Expert pattern: switch_glu (Gemma 4)")
+        else:
+            self.EXPERT_PATTERN = "switch_mlp"
 
         # Step 3: Detect model dimensions
         hidden_size = 2048  # default (35B)
@@ -852,7 +868,71 @@ class KandigaEngine:
         self._cpu_lib = _CPUExpertLib(large=is_large)
         self._log(f"CPU expert library loaded ({'lg' if is_large else 'standard'})")
 
-        # Step 5: Eagerly load shared (non-expert) parameters
+        # Step 5: Load shared (non-expert) parameters to GPU
+        # Check for 3-bit shared layers first (21% faster, 22% smaller)
+        model_name = self.model_path.split("/")[-1]
+        base_name = re.sub(r"-\d+bit$", "", model_name)
+        shared_3bit_path = os.path.join(
+            os.path.expanduser("~/.kandiga/models"),
+            base_name + "-3bit-shared",
+            "shared_3bit.safetensors",
+        )
+        if os.path.isfile(shared_3bit_path):
+            # Replace 4-bit lazy weights with 3-bit BEFORE evaluating
+            from mlx.utils import tree_unflatten
+            weights_3bit = mx.load(shared_3bit_path)
+            shared_3bit = {
+                k: v for k, v in weights_3bit.items()
+                if self.EXPERT_PATTERN not in k
+            }
+            # Convert Embedding → QuantizedEmbedding if 3-bit file has quantized embedding
+            for name, module in self._model.named_modules():
+                if isinstance(module, nn.Embedding) and f"{name}.scales" in shared_3bit:
+                    qembed = nn.QuantizedEmbedding(
+                        num_embeddings=module.weight.shape[0],
+                        dims=module.weight.shape[1],
+                        group_size=64, bits=3,
+                    )
+                    parts = name.split(".")
+                    parent = self._model
+                    for p in parts[:-1]:
+                        parent = getattr(parent, p)
+                    setattr(parent, parts[-1], qembed)
+            self._model.update(tree_unflatten(list(shared_3bit.items())))
+            # Update bits on every quantized module whose weights were replaced
+            # Detect actual bits from weight vs scales shape ratio
+            replaced_prefixes = {}
+            for k in shared_3bit:
+                if k.endswith(".weight"):
+                    prefix = k[:-len(".weight")]
+                    replaced_prefixes[prefix] = shared_3bit[k]
+            bits_updated = 0
+            for name, module in self._model.named_modules():
+                if name in replaced_prefixes and hasattr(module, "bits"):
+                    w = replaced_prefixes[name]
+                    s_key = f"{name}.scales"
+                    if s_key in shared_3bit:
+                        s = shared_3bit[s_key]
+                        # Infer bits from weight cols vs scales cols ratio
+                        # 4-bit: weight_cols = scales_cols * group_size / 8
+                        # 3-bit: weight_cols = scales_cols * group_size * 3 / 32
+                        w_cols = w.shape[-1]
+                        s_cols = s.shape[-1]
+                        expected_4bit = s_cols * module.group_size // 8
+                        expected_3bit = s_cols * module.group_size * 3 // 32
+                        if w_cols == expected_3bit:
+                            module.bits = 3
+                        elif w_cols == expected_4bit:
+                            module.bits = 4
+                        # else: leave as-is
+                    bits_updated += 1
+            del weights_3bit, shared_3bit
+            gc.collect()
+            self._log(f"3-bit shared layers applied ({bits_updated} modules, {os.path.getsize(shared_3bit_path) / 1e9:.2f}GB)")
+        else:
+            self._log("No 3-bit shared layers found, using 4-bit")
+
+        # Evaluate shared parameters (either 3-bit or 4-bit)
         flat = tree_flatten(self._model.parameters())
         shared = [v for k, v in flat if self.EXPERT_PATTERN not in k]
         if shared:
@@ -864,7 +944,6 @@ class KandigaEngine:
         # Freeing these mmap references gives the OS more page cache for expert pread.
         expert_params = [(k, v) for k, v in flat if self.EXPERT_PATTERN in k]
         if expert_params:
-            import gc
             # Delete lazy weight references from the model's parameter tree
             from mlx.utils import tree_unflatten
             zeroed = {k: mx.zeros((1,), dtype=mx.float16) for k, v in expert_params}
@@ -894,12 +973,17 @@ class KandigaEngine:
             self._log(f"TurboQuant failed: {e}")
 
         # Step 6: Count MoE layers and initialize CPU engine
+        # Detect MoE structure: Qwen = layer.mlp.switch_mlp, Gemma4 = layer.experts.switch_glu
         layers = _find_layers(self._model)
-        moe_count = sum(
-            1
-            for layer in layers
-            if hasattr(layer, "mlp") and hasattr(layer.mlp, "switch_mlp")
-        )
+        is_gemma_moe = any(hasattr(layer, "experts") and hasattr(getattr(layer, "experts", None), "switch_glu") for layer in layers)
+        moe_count = 0
+        for layer in layers:
+            if is_gemma_moe:
+                if hasattr(layer, "experts") and hasattr(layer.experts, "switch_glu"):
+                    moe_count += 1
+            else:
+                if hasattr(layer, "mlp") and hasattr(layer.mlp, "switch_mlp"):
+                    moe_count += 1
 
         self._cpu_engine = self._cpu_lib.init(packed_dir, moe_count)
         self._log(f"CPU engine initialized ({moe_count} MoE layers)")
@@ -908,8 +992,11 @@ class KandigaEngine:
         top_k = 8
         try:
             lm_args = getattr(getattr(self._model, 'language_model', self._model), 'args', None)
-            if lm_args and hasattr(lm_args, 'num_experts_per_tok'):
-                top_k = lm_args.num_experts_per_tok
+            if lm_args:
+                if hasattr(lm_args, 'num_experts_per_tok'):
+                    top_k = lm_args.num_experts_per_tok
+                elif hasattr(lm_args, 'top_k_experts'):
+                    top_k = lm_args.top_k_experts
         except Exception:
             pass
 
@@ -926,10 +1013,15 @@ class KandigaEngine:
         # Collect MoE layers and their router gate modules
         moe_layers_info = []
         for i, layer in enumerate(layers):
-            mlp = layer.mlp if hasattr(layer, "mlp") else None
-            if mlp is not None and hasattr(mlp, "switch_mlp"):
-                gate = getattr(mlp, 'gate', None)
-                moe_layers_info.append((i, layer, gate))
+            if is_gemma_moe:
+                if hasattr(layer, "experts") and hasattr(layer.experts, "switch_glu"):
+                    gate = getattr(getattr(layer, 'router', None), 'proj', None)
+                    moe_layers_info.append((i, layer, gate))
+            else:
+                mlp = layer.mlp if hasattr(layer, "mlp") else None
+                if mlp is not None and hasattr(mlp, "switch_mlp"):
+                    gate = getattr(mlp, 'gate', None)
+                    moe_layers_info.append((i, layer, gate))
 
         # Install CPU SwitchGLU wrappers with speculation
         _prefetch_state["predicted"].clear()
@@ -938,14 +1030,18 @@ class KandigaEngine:
 
         moe_idx = 0
         for pos, (layer_i, layer, _) in enumerate(moe_layers_info):
-            mlp = layer.mlp
             # Get NEXT layer's router gate for speculation
             next_gate = None
             if pos + 1 < len(moe_layers_info):
                 next_gate = moe_layers_info[pos + 1][2]
 
+            if is_gemma_moe:
+                original_expert = layer.experts.switch_glu
+            else:
+                original_expert = layer.mlp.switch_mlp
+
             wrapper = _CPUSwitchGLU(
-                original=mlp.switch_mlp,
+                original=original_expert,
                 layer_idx=moe_idx,
                 cpu_lib=self._cpu_lib,
                 cpu_engine=self._cpu_engine,
@@ -956,7 +1052,10 @@ class KandigaEngine:
                 expert_size=expert_size,
                 num_moe_layers=moe_count,
             )
-            mlp.switch_mlp = wrapper
+            if is_gemma_moe:
+                layer.experts.switch_glu = wrapper
+            else:
+                layer.mlp.switch_mlp = wrapper
             moe_idx += 1
 
         self._log(f"Expert speculation enabled ({moe_count} layers, top_k={top_k})")
@@ -966,8 +1065,14 @@ class KandigaEngine:
         if self.fast_mode:
             actual_k = max(top_k // 2, 4)
             for layer in layers:
+                # Qwen: layer.mlp.top_k, Gemma4: layer.experts has no top_k (handled by router)
                 if hasattr(layer, "mlp") and hasattr(layer.mlp, "top_k"):
                     layer.mlp.top_k = actual_k
+                # Also check wrapper directly
+                if is_gemma_moe and hasattr(layer, "experts") and hasattr(layer.experts, "switch_glu"):
+                    sw = layer.experts.switch_glu
+                    if hasattr(sw, "_top_k"):
+                        sw._top_k = actual_k
             self._log(f"Fast mode: K={actual_k} experts")
         else:
             self._log(f"Quality mode: K={top_k} experts")
@@ -978,37 +1083,37 @@ class KandigaEngine:
         if is_large:
             skip_count = 0
             for i, layer in enumerate(layers):
-                mlp = getattr(layer, 'mlp', None)
-                if mlp and hasattr(mlp, 'switch_mlp'):
-                    sw = mlp.switch_mlp
-                    if hasattr(sw, '_cpu_lib') and i % 3 == 0:
-                        hs = sw._hidden_size
-                        # Replace with zero-output (shared expert still runs)
-                        class _SkipExpert(nn.Module):
-                            def __init__(self, orig, hidden):
-                                super().__init__()
-                                self.original = orig
-                                self._h = hidden
-                            def __call__(self, x, indices):
-                                return mx.zeros(list(indices.shape) + [self._h], dtype=x.dtype)
-                        mlp.switch_mlp = _SkipExpert(sw, hs)
-                        skip_count += 1
+                # Find the expert module (Qwen: mlp.switch_mlp, Gemma: experts.switch_glu)
+                sw = None
+                parent = None
+                attr_name = None
+                if is_gemma_moe and hasattr(layer, 'experts') and hasattr(layer.experts, 'switch_glu'):
+                    sw = layer.experts.switch_glu
+                    parent = layer.experts
+                    attr_name = 'switch_glu'
+                elif hasattr(layer, 'mlp') and hasattr(layer.mlp, 'switch_mlp'):
+                    sw = layer.mlp.switch_mlp
+                    parent = layer.mlp
+                    attr_name = 'switch_mlp'
+
+                if sw and hasattr(sw, '_cpu_lib') and i % 3 == 0:
+                    hs = sw._hidden_size
+                    class _SkipExpert(nn.Module):
+                        def __init__(self, orig, hidden):
+                            super().__init__()
+                            self.original = orig
+                            self._h = hidden
+                        def __call__(self, x, indices):
+                            return mx.zeros(list(indices.shape) + [self._h], dtype=x.dtype)
+                    setattr(parent, attr_name, _SkipExpert(sw, hs))
+                    skip_count += 1
             if skip_count > 0:
                 self._log(f"Layer skipping: {skip_count}/{moe_count} layers use shared expert only")
 
-        # Step 10: Pre-warm page cache with a quick dummy prefill.
-        # Runs one short inference through all 40 layers, touching expert pages.
-        # By the time the user types their first message, pages are warm.
+        # Step 10: Pre-warm page cache via background thread.
+        # Reads a sample of expert pages into OS page cache without generating.
         if expert_size > 0:
-            try:
-                self._ready = True  # temporarily enable
-                self.start_session()
-                for _ in self.session_generate("Hi", max_tokens=1):
-                    pass
-                self.end_session()
-                self._ready = False  # reset, will be set below
-            except Exception:
-                pass
+            self._prewarm_cache(packed_dir, moe_count, expert_size, hidden_size)
 
         self._log(f"Engine ready ({moe_idx} MoE layers, CPU expert wrappers installed)")
         self._ready = True

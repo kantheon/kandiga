@@ -41,7 +41,7 @@
 #define HEADER_SIZE     4096UL
 #define EXPERT_SIZE     1769472UL
 
-/* Expert tensor byte offsets within each expert block */
+/* Expert tensor byte offsets within each expert block — 4-bit */
 #define GATE_WEIGHT_OFF   0
 #define GATE_SCALES_OFF   524288
 #define GATE_BIASES_OFF   557056
@@ -52,12 +52,26 @@
 #define DOWN_SCALES_OFF   1703936
 #define DOWN_BIASES_OFF   1736704
 
+/* Expert tensor byte offsets within each expert block — 3-bit */
+#define GATE_WEIGHT_OFF_3  0
+#define GATE_SCALES_OFF_3  393216
+#define GATE_BIASES_OFF_3  425984
+#define UP_WEIGHT_OFF_3    458752
+#define UP_SCALES_OFF_3    851968
+#define UP_BIASES_OFF_3    884736
+#define DOWN_WEIGHT_OFF_3  917504
+#define DOWN_SCALES_OFF_3  1310720
+#define DOWN_BIASES_OFF_3  1343488
+#define EXPERT_SIZE_3BIT   1376256UL
+
 /* ----------------------------------------------------------------------- */
 /* Engine state                                                             */
 /* ----------------------------------------------------------------------- */
 typedef struct {
     int*    layer_fds;
     int     num_layers;
+    int     bits;          /* 3 or 4 — auto-detected from header */
+    size_t  expert_size;   /* bytes per expert block */
     char*   expert_bufs[MAX_EXPERTS];
 } KandigaCPUExpertEngine;
 
@@ -82,6 +96,123 @@ static inline float half_to_float(uint16_t h) {
     _Float16 f16;
     memcpy(&f16, &h, sizeof(f16));
     return (float)f16;
+}
+
+/* ----------------------------------------------------------------------- */
+/* NEON-optimized 3-bit dequant matrix-vector multiply                      */
+/* MLX 3-bit packing: 3 bytes → 8 values (same as quantized.h)             */
+/* ----------------------------------------------------------------------- */
+static void cpu_dequant_matvec_3bit(
+    const uint8_t*  __restrict weight,  /* packed 3-bit: out_dim × (in_dim*3/8) bytes */
+    const uint16_t* __restrict scales,
+    const uint16_t* __restrict biases,
+    const float*    __restrict x,
+    float*          __restrict output,
+    int out_dim,
+    int in_dim,
+    int group_size
+) {
+    int bytes_per_row = in_dim * 3 / 8;      /* 3 bytes per 8 values */
+    int num_groups = in_dim / group_size;
+    int packs_per_group = group_size / 8;     /* 8 values per 3-byte pack */
+
+    for (int row = 0; row < out_dim; row++) {
+        const uint8_t*  w_row = weight + row * bytes_per_row;
+        const uint16_t* s_row = scales + row * num_groups;
+        const uint16_t* b_row = biases + row * num_groups;
+
+#ifdef __ARM_NEON__
+        float32x4_t acc_vec = vdupq_n_f32(0.0f);
+
+        for (int g = 0; g < num_groups; g++) {
+            float scale = bf16_to_float(s_row[g]);
+            float bias  = bf16_to_float(b_row[g]);
+
+            float32x4_t v_scale = vdupq_n_f32(scale);
+            float32x4_t v_bias  = vdupq_n_f32(bias);
+
+            const uint8_t* wp = w_row + g * packs_per_group * 3;
+            int xb = g * group_size;
+
+            /* Process 2 packs per iteration = 6 bytes → 16 values → 4 NEON FMAs */
+            for (int p = 0; p < packs_per_group; p += 2) {
+                const uint8_t* b0 = wp + p * 3;       /* first pack: 3 bytes → 8 vals */
+                const uint8_t* b1 = wp + p * 3 + 3;   /* second pack: 3 bytes → 8 vals */
+                const float* xp = x + xb + p * 8;
+
+                /* Unpack first 3 bytes → 8 values */
+                float32x4_t n0 = {
+                    (float)( b0[0]       & 0x07),
+                    (float)((b0[0] >> 3) & 0x07),
+                    (float)(((b0[0] >> 6) & 0x03) | ((b0[1] & 0x01) << 2)),
+                    (float)((b0[1] >> 1) & 0x07)
+                };
+                float32x4_t n1 = {
+                    (float)((b0[1] >> 4) & 0x07),
+                    (float)(((b0[1] >> 7) & 0x01) | ((b0[2] & 0x03) << 1)),
+                    (float)((b0[2] >> 2) & 0x07),
+                    (float)((b0[2] >> 5) & 0x07)
+                };
+
+                /* Unpack second 3 bytes → 8 values */
+                float32x4_t n2 = {
+                    (float)( b1[0]       & 0x07),
+                    (float)((b1[0] >> 3) & 0x07),
+                    (float)(((b1[0] >> 6) & 0x03) | ((b1[1] & 0x01) << 2)),
+                    (float)((b1[1] >> 1) & 0x07)
+                };
+                float32x4_t n3 = {
+                    (float)((b1[1] >> 4) & 0x07),
+                    (float)(((b1[1] >> 7) & 0x01) | ((b1[2] & 0x03) << 1)),
+                    (float)((b1[2] >> 2) & 0x07),
+                    (float)((b1[2] >> 5) & 0x07)
+                };
+
+                /* Dequant + FMA: w = nibble * scale + bias; acc += w * x */
+                acc_vec = vfmaq_f32(acc_vec, vfmaq_f32(v_bias, n0, v_scale), vld1q_f32(xp));
+                acc_vec = vfmaq_f32(acc_vec, vfmaq_f32(v_bias, n1, v_scale), vld1q_f32(xp+4));
+                acc_vec = vfmaq_f32(acc_vec, vfmaq_f32(v_bias, n2, v_scale), vld1q_f32(xp+8));
+                acc_vec = vfmaq_f32(acc_vec, vfmaq_f32(v_bias, n3, v_scale), vld1q_f32(xp+12));
+            }
+        }
+
+        float32x2_t sum_pair = vadd_f32(vget_low_f32(acc_vec), vget_high_f32(acc_vec));
+        float32x2_t sum_final = vpadd_f32(sum_pair, sum_pair);
+        output[row] = vget_lane_f32(sum_final, 0);
+#else
+        float acc = 0.0f;
+        for (int g = 0; g < num_groups; g++) {
+            float scale = bf16_to_float(s_row[g]);
+            float bias  = bf16_to_float(b_row[g]);
+
+            const uint8_t* wp = w_row + g * packs_per_group * 3;
+
+            for (int p = 0; p < packs_per_group; p++) {
+                const uint8_t* b0 = wp + p * 3;
+                int xi = g * group_size + p * 8;
+
+                float v0 = (float)( b0[0]       & 0x07);
+                float v1 = (float)((b0[0] >> 3) & 0x07);
+                float v2 = (float)(((b0[0] >> 6) & 0x03) | ((b0[1] & 0x01) << 2));
+                float v3 = (float)((b0[1] >> 1) & 0x07);
+                float v4 = (float)((b0[1] >> 4) & 0x07);
+                float v5 = (float)(((b0[1] >> 7) & 0x01) | ((b0[2] & 0x03) << 1));
+                float v6 = (float)((b0[2] >> 2) & 0x07);
+                float v7 = (float)((b0[2] >> 5) & 0x07);
+
+                acc += (v0 * scale + bias) * x[xi + 0];
+                acc += (v1 * scale + bias) * x[xi + 1];
+                acc += (v2 * scale + bias) * x[xi + 2];
+                acc += (v3 * scale + bias) * x[xi + 3];
+                acc += (v4 * scale + bias) * x[xi + 4];
+                acc += (v5 * scale + bias) * x[xi + 5];
+                acc += (v6 * scale + bias) * x[xi + 6];
+                acc += (v7 * scale + bias) * x[xi + 7];
+            }
+        }
+        output[row] = acc;
+#endif
+    }
 }
 
 /* ----------------------------------------------------------------------- */
@@ -219,6 +350,57 @@ static int compute_single_expert(
 }
 
 /* ----------------------------------------------------------------------- */
+/* Single expert MLP: gate + up + SwiGLU + down — 3-bit variant            */
+/* ----------------------------------------------------------------------- */
+static int compute_single_expert_3bit(
+    const char* expert_data,
+    const float* x,
+    float* output
+) {
+    const uint8_t*  gate_w = (const uint8_t*) (expert_data + GATE_WEIGHT_OFF_3);
+    const uint16_t* gate_s = (const uint16_t*)(expert_data + GATE_SCALES_OFF_3);
+    const uint16_t* gate_b = (const uint16_t*)(expert_data + GATE_BIASES_OFF_3);
+
+    const uint8_t*  up_w = (const uint8_t*) (expert_data + UP_WEIGHT_OFF_3);
+    const uint16_t* up_s = (const uint16_t*)(expert_data + UP_SCALES_OFF_3);
+    const uint16_t* up_b = (const uint16_t*)(expert_data + UP_BIASES_OFF_3);
+
+    const uint8_t*  down_w = (const uint8_t*) (expert_data + DOWN_WEIGHT_OFF_3);
+    const uint16_t* down_s = (const uint16_t*)(expert_data + DOWN_SCALES_OFF_3);
+    const uint16_t* down_b = (const uint16_t*)(expert_data + DOWN_BIASES_OFF_3);
+
+    /* gate_proj */
+    float gate_out[EXPERT_DIM];
+    cpu_dequant_matvec_3bit(gate_w, gate_s, gate_b, x, gate_out,
+                            EXPERT_DIM, HIDDEN_SIZE, GROUP_SIZE);
+
+    /* up_proj */
+    float up_out[EXPERT_DIM];
+    cpu_dequant_matvec_3bit(up_w, up_s, up_b, x, up_out,
+                            EXPERT_DIM, HIDDEN_SIZE, GROUP_SIZE);
+
+    /* SwiGLU activation: silu(gate) * up */
+    float activated[EXPERT_DIM];
+    for (int i = 0; i < EXPERT_DIM; i += 4) {
+        float silu0 = gate_out[i]   / (1.0f + expf(-gate_out[i]));
+        float silu1 = gate_out[i+1] / (1.0f + expf(-gate_out[i+1]));
+        float silu2 = gate_out[i+2] / (1.0f + expf(-gate_out[i+2]));
+        float silu3 = gate_out[i+3] / (1.0f + expf(-gate_out[i+3]));
+
+        activated[i]   = silu0 * up_out[i];
+        activated[i+1] = silu1 * up_out[i+1];
+        activated[i+2] = silu2 * up_out[i+2];
+        activated[i+3] = silu3 * up_out[i+3];
+    }
+
+    /* down_proj */
+    cpu_dequant_matvec_3bit(down_w, down_s, down_b, activated, output,
+                            HIDDEN_SIZE, EXPERT_DIM, GROUP_SIZE);
+
+    return 0;
+}
+
+/* ----------------------------------------------------------------------- */
 /* bakan_cpu_expert_init                                                    */
 /* ----------------------------------------------------------------------- */
 void* bakan_cpu_expert_init(const char* packed_dir, int num_layers) {
@@ -229,6 +411,8 @@ void* bakan_cpu_expert_init(const char* packed_dir, int num_layers) {
     }
 
     engine->num_layers = num_layers;
+    engine->bits = 4;               /* default */
+    engine->expert_size = EXPERT_SIZE;
 
     engine->layer_fds = (int*)calloc((size_t)num_layers, sizeof(int));
     if (!engine->layer_fds) {
@@ -249,10 +433,24 @@ void* bakan_cpu_expert_init(const char* packed_dir, int num_layers) {
             return NULL;
         }
         engine->layer_fds[i] = fd;
+
+        /* Auto-detect bits from first file's expert_size in header */
+        if (i == 0) {
+            uint8_t hdr[24];
+            ssize_t n = pread(fd, hdr, 24, 0);
+            if (n >= 20 && hdr[0] == 'B' && hdr[1] == 'K' && hdr[2] == 'E' && hdr[3] == 'X') {
+                uint64_t esz;
+                memcpy(&esz, hdr + 12, 8);
+                engine->expert_size = (size_t)esz;
+                if (esz == EXPERT_SIZE_3BIT) {
+                    engine->bits = 3;
+                }
+            }
+        }
     }
 
     for (int i = 0; i < MAX_EXPERTS; i++) {
-        engine->expert_bufs[i] = (char*)malloc(EXPERT_SIZE);
+        engine->expert_bufs[i] = (char*)malloc(engine->expert_size);
         if (!engine->expert_bufs[i]) {
             fprintf(stderr, "[kandiga] ERROR: Failed to allocate expert buffer %d\n", i);
             bakan_cpu_expert_destroy(engine);
@@ -261,7 +459,8 @@ void* bakan_cpu_expert_init(const char* packed_dir, int num_layers) {
     }
 
     fprintf(stderr, "[kandiga] Initialized: %d layers, %d expert buffers "
-            "(%zu KB each)\n", num_layers, MAX_EXPERTS, EXPERT_SIZE / 1024);
+            "(%zu KB each), %d-bit\n", num_layers, MAX_EXPERTS,
+            engine->expert_size / 1024, engine->bits);
 
     return engine;
 }
@@ -300,13 +499,14 @@ int bakan_cpu_expert_mlp(
         dispatch_queue_t io_queue = dispatch_get_global_queue(
             QOS_CLASS_USER_INTERACTIVE, 0);
 
+        size_t esz = engine->expert_size;
         for (int k = 0; k < num_experts; k++) {
             int expert_idx = expert_indices[k];
             char* buf = engine->expert_bufs[k];
             dispatch_group_async(group, io_queue, ^{
-                off_t offset = (off_t)HEADER_SIZE + (off_t)expert_idx * (off_t)EXPERT_SIZE;
-                ssize_t n = pread(fd, buf, EXPERT_SIZE, offset);
-                if (n != (ssize_t)EXPERT_SIZE) {
+                off_t offset = (off_t)HEADER_SIZE + (off_t)expert_idx * (off_t)esz;
+                ssize_t n = pread(fd, buf, esz, offset);
+                if (n != (ssize_t)esz) {
                     pread_error = 1;
                 }
             });
@@ -326,11 +526,14 @@ int bakan_cpu_expert_mlp(
         dispatch_queue_t compute_queue = dispatch_get_global_queue(
             QOS_CLASS_USER_INTERACTIVE, 0);
 
+        int use_3bit = (engine->bits == 3);
         for (int k = 0; k < num_experts; k++) {
             const char* expert_data = engine->expert_bufs[k];
             float* expert_output = output_f32 + k * HIDDEN_SIZE;
             dispatch_group_async(group, compute_queue, ^{
-                int ret = compute_single_expert(expert_data, x_f32, expert_output);
+                int ret = use_3bit
+                    ? compute_single_expert_3bit(expert_data, x_f32, expert_output)
+                    : compute_single_expert(expert_data, x_f32, expert_output);
                 if (ret != 0) {
                     compute_error = 1;
                 }
@@ -404,9 +607,9 @@ int bakan_cpu_expert_mlp_batch_f16(
             expert_to_slot[eidx] = u;
             char* buf = engine->expert_bufs[u];
             dispatch_group_async(group, io_queue, ^{
-                off_t offset = (off_t)HEADER_SIZE + (off_t)eidx * (off_t)EXPERT_SIZE;
-                ssize_t n = pread(fd, buf, EXPERT_SIZE, offset);
-                if (n != (ssize_t)EXPERT_SIZE) pread_error = 1;
+                off_t offset = (off_t)HEADER_SIZE + (off_t)eidx * (off_t)engine->expert_size;
+                ssize_t n = pread(fd, buf, engine->expert_size, offset);
+                if (n != (ssize_t)engine->expert_size) pread_error = 1;
             });
         }
         dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
@@ -415,8 +618,8 @@ int bakan_cpu_expert_mlp_batch_f16(
     for (int u = MAX_EXPERTS; u < num_unique; u++) {
         int eidx = unique_experts[u];
         expert_to_slot[eidx] = u % MAX_EXPERTS;
-        off_t offset = (off_t)HEADER_SIZE + (off_t)eidx * (off_t)EXPERT_SIZE;
-        pread(fd, engine->expert_bufs[u % MAX_EXPERTS], EXPERT_SIZE, offset);
+        off_t offset = (off_t)HEADER_SIZE + (off_t)eidx * (off_t)engine->expert_size;
+        pread(fd, engine->expert_bufs[u % MAX_EXPERTS], engine->expert_size, offset);
     }
     if (pread_error) return -1;
 
@@ -438,7 +641,10 @@ int bakan_cpu_expert_mlp_batch_f16(
             int slot = expert_to_slot[eidx];
             if (slot < 0) continue;
             const char* expert_data = engine->expert_bufs[slot];
-            compute_single_expert(expert_data, x_f32, output_f32 + k * HIDDEN_SIZE);
+            if (engine->bits == 3)
+                compute_single_expert_3bit(expert_data, x_f32, output_f32 + k * HIDDEN_SIZE);
+            else
+                compute_single_expert(expert_data, x_f32, output_f32 + k * HIDDEN_SIZE);
         }
 
         /* Convert f32 output to f16 */
@@ -596,9 +802,9 @@ int bakan_cpu_expert_mlp_prefill_f16(
 
         /* pread this expert's weights ONCE */
         char* buf = engine->expert_bufs[0];  /* reuse buffer 0 */
-        off_t offset = (off_t)HEADER_SIZE + (off_t)eidx * (off_t)EXPERT_SIZE;
-        ssize_t n = pread(fd, buf, EXPERT_SIZE, offset);
-        if (n != (ssize_t)EXPERT_SIZE) return -1;
+        off_t offset = (off_t)HEADER_SIZE + (off_t)eidx * (off_t)engine->expert_size;
+        ssize_t n = pread(fd, buf, engine->expert_size, offset);
+        if (n != (ssize_t)engine->expert_size) return -1;
 
         /* Compute for each token assigned to this expert */
         /* Expert weights are HOT in L1/L2 cache for subsequent tokens */
@@ -615,7 +821,10 @@ int bakan_cpu_expert_mlp_prefill_f16(
 
             /* Compute expert MLP */
             float out_f32[HIDDEN_SIZE];
-            compute_single_expert(buf, x_f32, out_f32);
+            if (engine->bits == 3)
+                compute_single_expert_3bit(buf, x_f32, out_f32);
+            else
+                compute_single_expert(buf, x_f32, out_f32);
 
             /* Convert output f32 -> f16 and write to correct position */
             uint16_t* out_pos = out + (token_idx * K + k_pos) * HIDDEN_SIZE;
@@ -640,13 +849,14 @@ int bakan_cpu_expert_pread_batch(
     int layer_idx,
     const int32_t* expert_ids,
     int num_experts_to_read,
-    void* output_buffer  /* caller-allocated: num_experts * EXPERT_SIZE bytes */
+    void* output_buffer  /* caller-allocated: num_experts * expert_size bytes */
 ) {
     KandigaCPUExpertEngine* engine = (KandigaCPUExpertEngine*)engine_ptr;
     if (!engine || layer_idx < 0 || layer_idx >= engine->num_layers) return -1;
 
     int fd = engine->layer_fds[layer_idx];
     char* out = (char*)output_buffer;
+    size_t esz = engine->expert_size;
 
     /* Parallel pread via GCD */
     __block int err = 0;
@@ -655,11 +865,11 @@ int bakan_cpu_expert_pread_batch(
 
     for (int i = 0; i < num_experts_to_read; i++) {
         int eidx = expert_ids[i];
-        char* dst = out + (size_t)i * EXPERT_SIZE;
+        char* dst = out + (size_t)i * esz;
         dispatch_group_async(group, q, ^{
-            off_t offset = (off_t)HEADER_SIZE + (off_t)eidx * (off_t)EXPERT_SIZE;
-            ssize_t n = pread(fd, dst, EXPERT_SIZE, offset);
-            if (n != (ssize_t)EXPERT_SIZE) err = 1;
+            off_t offset = (off_t)HEADER_SIZE + (off_t)eidx * (off_t)esz;
+            ssize_t n = pread(fd, dst, esz, offset);
+            if (n != (ssize_t)esz) err = 1;
         });
     }
     dispatch_group_wait(group, DISPATCH_TIME_FOREVER);

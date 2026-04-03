@@ -44,6 +44,7 @@ typedef struct {
     size_t  expert_size;
     int     hidden_size;
     int     expert_dim;
+    int     bits;             /* 3 or 4 — auto-detected from expert_size */
 
     size_t  gate_w_off, gate_s_off, gate_b_off;
     size_t  up_w_off,   up_s_off,   up_b_off;
@@ -83,8 +84,8 @@ static int parse_header(int fd, Engine* e) {
         memcpy(&d1,  hdr+pos, 4); pos += 4;
         pos++; /* dtype */
 
-        if      (strstr(nm,"gate_proj.weight")) { e->gate_w_off=off; e->expert_dim=(int)d0; e->hidden_size=(int)(d1*8); }
-        else if (strstr(nm,"gate_proj.scales")) { e->gate_s_off=off; }
+        if      (strstr(nm,"gate_proj.weight")) { e->gate_w_off=off; e->expert_dim=(int)d0; }
+        else if (strstr(nm,"gate_proj.scales")) { e->gate_s_off=off; e->hidden_size=(int)(d1*GROUP_SIZE); }
         else if (strstr(nm,"gate_proj.biases")) { e->gate_b_off=off; }
         else if (strstr(nm,"up_proj.weight"))   { e->up_w_off=off; }
         else if (strstr(nm,"up_proj.scales"))   { e->up_s_off=off; }
@@ -93,9 +94,74 @@ static int parse_header(int fd, Engine* e) {
         else if (strstr(nm,"down_proj.scales")) { e->down_s_off=off; }
         else if (strstr(nm,"down_proj.biases")) { e->down_b_off=off; }
     }
-    fprintf(stderr, "[kandiga-lg] h=%d e=%d esz=%zu n=%d\n",
-            e->hidden_size, e->expert_dim, e->expert_size, e->num_experts_total);
+    /* Detect 3-bit vs 4-bit from weight size vs expected */
+    /* 4-bit: gate_weight_bytes = expert_dim * hidden_size / 8 * 4 = expert_dim * hidden_size / 2 */
+    /* 3-bit: gate_weight_bytes = expert_dim * hidden_size * 3 / 8 */
+    size_t expected_4bit = (size_t)e->expert_dim * (size_t)e->hidden_size / 2;
+    size_t actual_w_bytes = e->gate_s_off - e->gate_w_off;
+    if (actual_w_bytes < expected_4bit) {
+        e->bits = 3;
+    } else {
+        e->bits = 4;
+    }
+
+    fprintf(stderr, "[kandiga-lg] h=%d e=%d esz=%zu n=%d bits=%d\n",
+            e->hidden_size, e->expert_dim, e->expert_size, e->num_experts_total, e->bits);
     return 0;
+}
+
+/* NEON 3-bit matvec — MLX packing: 3 bytes → 8 values */
+static void matvec3(
+    const uint8_t* w, const uint16_t* s, const uint16_t* b,
+    const float* x, float* out, int od, int id, int gs
+) {
+    int bpr = id*3/8, ng = id/gs, ppg = gs/8; /* packs per group */
+    for (int r = 0; r < od; r++) {
+        const uint8_t*  wr = w + r*bpr;
+        const uint16_t* sr = s + r*ng;
+        const uint16_t* br = b + r*ng;
+#ifdef __ARM_NEON__
+        float32x4_t acc = vdupq_n_f32(0);
+        for (int g = 0; g < ng; g++) {
+            float sc = bf16_to_f32(sr[g]), bi = bf16_to_f32(br[g]);
+            float32x4_t vs = vdupq_n_f32(sc), vb = vdupq_n_f32(bi);
+            const uint8_t* wp = wr + g*ppg*3;
+            int xb = g*gs;
+            for (int p = 0; p < ppg; p += 2) {
+                const uint8_t* a = wp + p*3;
+                const uint8_t* c = a + 3;
+                const float* xp = x + xb + p*8;
+                /* Unpack 2×3 bytes = 16 values */
+                float32x4_t n0 = {(float)(a[0]&7),(float)((a[0]>>3)&7),
+                    (float)(((a[0]>>6)&3)|((a[1]&1)<<2)),(float)((a[1]>>1)&7)};
+                float32x4_t n1 = {(float)((a[1]>>4)&7),
+                    (float)(((a[1]>>7)&1)|((a[2]&3)<<1)),
+                    (float)((a[2]>>2)&7),(float)((a[2]>>5)&7)};
+                float32x4_t n2 = {(float)(c[0]&7),(float)((c[0]>>3)&7),
+                    (float)(((c[0]>>6)&3)|((c[1]&1)<<2)),(float)((c[1]>>1)&7)};
+                float32x4_t n3 = {(float)((c[1]>>4)&7),
+                    (float)(((c[1]>>7)&1)|((c[2]&3)<<1)),
+                    (float)((c[2]>>2)&7),(float)((c[2]>>5)&7)};
+                acc=vfmaq_f32(acc,vfmaq_f32(vb,n0,vs),vld1q_f32(xp));
+                acc=vfmaq_f32(acc,vfmaq_f32(vb,n1,vs),vld1q_f32(xp+4));
+                acc=vfmaq_f32(acc,vfmaq_f32(vb,n2,vs),vld1q_f32(xp+8));
+                acc=vfmaq_f32(acc,vfmaq_f32(vb,n3,vs),vld1q_f32(xp+12));
+            }
+        }
+        float32x2_t sp=vadd_f32(vget_low_f32(acc),vget_high_f32(acc));
+        out[r]=vget_lane_f32(vpadd_f32(sp,sp),0);
+#else
+        float a=0;
+        for(int g=0;g<ng;g++){float sc=bf16_to_f32(sr[g]),bi=bf16_to_f32(br[g]);
+        const uint8_t* wp=wr+g*ppg*3;
+        for(int p=0;p<ppg;p++){const uint8_t* b0=wp+p*3;int xi=g*gs+p*8;
+        a+=((float)(b0[0]&7)*sc+bi)*x[xi]+((float)((b0[0]>>3)&7)*sc+bi)*x[xi+1]
+          +((float)(((b0[0]>>6)&3)|((b0[1]&1)<<2))*sc+bi)*x[xi+2]+((float)((b0[1]>>1)&7)*sc+bi)*x[xi+3]
+          +((float)((b0[1]>>4)&7)*sc+bi)*x[xi+4]+((float)(((b0[1]>>7)&1)|((b0[2]&3)<<1))*sc+bi)*x[xi+5]
+          +((float)((b0[2]>>2)&7)*sc+bi)*x[xi+6]+((float)((b0[2]>>5)&7)*sc+bi)*x[xi+7];}}
+        out[r]=a;
+#endif
+    }
 }
 
 /* NEON matvec */
@@ -150,10 +216,17 @@ static int expert_mlp(const Engine* e, const char* data,
     int h=e->hidden_size, ed=e->expert_dim;
     float *go=scratch, *uo=scratch+ed, *act=scratch+2*ed;
 
-    matvec4((const uint32_t*)(data+e->gate_w_off),(const uint16_t*)(data+e->gate_s_off),
-            (const uint16_t*)(data+e->gate_b_off), x, go, ed, h, GROUP_SIZE);
-    matvec4((const uint32_t*)(data+e->up_w_off),(const uint16_t*)(data+e->up_s_off),
-            (const uint16_t*)(data+e->up_b_off), x, uo, ed, h, GROUP_SIZE);
+    if (e->bits == 3) {
+        matvec3((const uint8_t*)(data+e->gate_w_off),(const uint16_t*)(data+e->gate_s_off),
+                (const uint16_t*)(data+e->gate_b_off), x, go, ed, h, GROUP_SIZE);
+        matvec3((const uint8_t*)(data+e->up_w_off),(const uint16_t*)(data+e->up_s_off),
+                (const uint16_t*)(data+e->up_b_off), x, uo, ed, h, GROUP_SIZE);
+    } else {
+        matvec4((const uint32_t*)(data+e->gate_w_off),(const uint16_t*)(data+e->gate_s_off),
+                (const uint16_t*)(data+e->gate_b_off), x, go, ed, h, GROUP_SIZE);
+        matvec4((const uint32_t*)(data+e->up_w_off),(const uint16_t*)(data+e->up_s_off),
+                (const uint16_t*)(data+e->up_b_off), x, uo, ed, h, GROUP_SIZE);
+    }
 
     for(int i=0;i<ed;i+=4){
         float s0=go[i]/(1+expf(-go[i])), s1=go[i+1]/(1+expf(-go[i+1]));
@@ -161,8 +234,13 @@ static int expert_mlp(const Engine* e, const char* data,
         act[i]=s0*uo[i]; act[i+1]=s1*uo[i+1]; act[i+2]=s2*uo[i+2]; act[i+3]=s3*uo[i+3];
     }
 
-    matvec4((const uint32_t*)(data+e->down_w_off),(const uint16_t*)(data+e->down_s_off),
-            (const uint16_t*)(data+e->down_b_off), act, out, h, ed, GROUP_SIZE);
+    if (e->bits == 3) {
+        matvec3((const uint8_t*)(data+e->down_w_off),(const uint16_t*)(data+e->down_s_off),
+                (const uint16_t*)(data+e->down_b_off), act, out, h, ed, GROUP_SIZE);
+    } else {
+        matvec4((const uint32_t*)(data+e->down_w_off),(const uint16_t*)(data+e->down_s_off),
+                (const uint16_t*)(data+e->down_b_off), act, out, h, ed, GROUP_SIZE);
+    }
     return 0;
 }
 

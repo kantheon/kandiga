@@ -383,7 +383,10 @@ class AgentPipeline:
         # Route via 4B model (fast) + keyword fallback
         route = self._classify_route(query, full_ctx)
 
-        if route == "agentic":
+        if route == "heavy":
+            self.on_stage("route", "heavy (122B)")
+            result = self._run_heavy(query, full_ctx)
+        elif route == "agentic":
             self.on_stage("route", "agentic")
             result = self._run_agentic(query, full_ctx)
         elif route == "tool":
@@ -393,7 +396,7 @@ class AgentPipeline:
             self.on_stage("route", "think (35B)")
             result = self._run_think(query, full_ctx)
         else:
-            self.on_stage("route", "direct")
+            self.on_stage("route", "direct (4B)")
             result = self._run_direct(query, full_ctx)
 
         result.duration_ms = int((time.time() - t_start) * 1000)
@@ -455,74 +458,71 @@ class AgentPipeline:
     ROUTE_PROMPT = (
         "You are a query classifier. Decide what kind of response is needed.\n"
         "You have tools for: files, shell, web search, browser, calendar, "
-        "reminders, notes, iMessage, screenshots.\n\n"
+        "reminders, notes, notifications, screenshots.\n\n"
         "Respond with ONLY one word:\n"
-        "- TOOL — user wants actions done (read/write/run/search/create/list)\n"
+        "- DIRECT — simple greeting, quick factual answer, trivial math\n"
+        "- TOOL — user wants ONE action done (read/write/run/search/create/list/weather/news)\n"
         "- AGENTIC — user wants MULTIPLE actions in sequence\n"
-        "- THINK — complex question needing deep reasoning (explain, analyze, compare, debug code, plan)\n"
-        "- DIRECT — simple greeting or quick factual answer\n\n"
+        "- THINK — moderate reasoning (explain, analyze, compare, plan, summarize)\n"
+        "- HEAVY — complex coding, deep analysis, write a full program, advanced math\n\n"
         "Examples:\n"
         "- 'hello' → DIRECT\n"
         "- '2+2' → DIRECT\n"
+        "- 'thanks' → DIRECT\n"
+        "- 'what is the capital of France' → DIRECT\n"
+        "- 'list files in Downloads' → TOOL\n"
+        "- 'list files in ~/Documents' → TOOL\n"
         "- 'read config.yaml' → TOOL\n"
+        "- 'show me whats in /tmp' → TOOL\n"
         "- 'search the web for AI news' → TOOL\n"
+        "- 'whats the weather' → TOOL\n"
         "- 'run it' → TOOL\n"
+        "- 'yes do it' → TOOL\n"
+        "- 'write hello world to test.py' → TOOL\n"
+        "- 'delete that file' → TOOL\n"
+        "- 'remind me to call mom' → TOOL\n"
         "- 'create a file and then run it' → AGENTIC\n"
         "- 'read the file, fix the bug, save it' → AGENTIC\n"
-        "- 'explain how this code works' → THINK\n"
-        "- 'analyze this data and tell me what patterns you see' → THINK\n"
-        "- 'what architecture should I use for this project' → THINK\n"
-        "- 'debug this error message' → THINK\n"
-        "- 'compare Python vs Rust for this use case' → THINK\n"
-        "- 'whats the news this week' → TOOL\n"
-        "- 'yes do it' → TOOL\n\n"
-        "Respond with ONLY: TOOL, AGENTIC, THINK, or DIRECT"
+        "- 'find all python files and count lines' → AGENTIC\n"
+        "- 'explain how transformers work' → THINK\n"
+        "- 'compare Python vs Rust' → THINK\n"
+        "- 'summarize this document' → THINK\n"
+        "- 'what architecture should I use' → THINK\n"
+        "- 'write a full web scraper in Python' → HEAVY\n"
+        "- 'implement a red-black tree with insert and delete' → HEAVY\n"
+        "- 'analyze this codebase architecture in depth' → HEAVY\n"
+        "- 'solve this differential equation step by step' → HEAVY\n\n"
+        "IMPORTANT: If the user mentions files, directories, paths, shell commands, "
+        "web search, calendar, reminders, or any action requiring tools — choose TOOL or AGENTIC, not THINK.\n"
+        "Respond with ONLY: DIRECT, TOOL, AGENTIC, THINK, or HEAVY"
     )
 
     def _classify_route(self, query: str, context: str) -> str:
-        """Classify query intent using 4B model (fast) + keyword fallback."""
-
-        # Keyword fast-path for obvious cases
-        q = query.lower().strip()
-        if q in ("hi", "hello", "hey", "thanks", "thank you", "ok", "yes", "no"):
-            return "direct"
-
-        # Use 4B model to classify
+        """Classify query intent using 4B model. The model decides — no keyword overrides."""
         self.on_stage("classify", "4B routing...")
         try:
             user_msg = query
             if context:
-                # Include recent context so model knows what "it" refers to
                 user_msg = f"Recent context: {context[-500:]}\n\nUser message: {query}"
 
             raw = self._gen_fast(self.ROUTE_PROMPT, user_msg, max_tokens=10)
             raw = raw.strip().upper()
 
-            if "AGENTIC" in raw:
+            if "HEAVY" in raw:
+                return "heavy"
+            elif "AGENTIC" in raw:
                 return "agentic"
             elif "TOOL" in raw:
                 return "tool"
             elif "THINK" in raw:
-                # Override THINK → TOOL if keywords clearly indicate tool use
-                # The model sometimes classifies action requests as "thinking"
-                if _needs_tools(query):
-                    return "agentic" if _needs_multi_step(query) else "tool"
                 return "think"
             elif "DIRECT" in raw:
-                # Override DIRECT → TOOL if keywords clearly indicate tool use
-                if _needs_tools(query):
-                    return "agentic" if _needs_multi_step(query) else "tool"
                 return "direct"
         except Exception:
             pass
 
-        # Keyword fallback
-        if _needs_tools(query):
-            if _needs_multi_step(query):
-                return "agentic"
-            return "tool"
-
-        return "direct"
+        # Fallback: let 35B handle it
+        return "think"
 
     # --- Generation helpers ---
 
@@ -639,10 +639,13 @@ class AgentPipeline:
     # --- Direct (no tools) ---
 
     def _run_direct(self, query: str, context: str) -> AgentResult:
-        # 35B K=2 writes the response (fast, ~10-13 tok/s)
-        self.on_stage("brain-k2", "Writing response (35B K=2)...")
+        # 4B answers directly — no 35B needed for greetings/simple (136 tok/s)
+        self.on_stage("fast", "4B answering...")
         user = f"Context:\n{context}\n\nQuery: {query}" if context else query
-        content = self._gen_brain(SYNTH_PROMPT, user)
+        content = self._gen_fast(
+            "You are Kandiga, a helpful AI agent. Answer concisely.",
+            user, max_tokens=512,
+        )
 
         conf, verified, flags = _verify(content, context, [])
         self.on_stage("done", f"confidence={conf:.2f}")
@@ -675,6 +678,62 @@ class AgentPipeline:
         self.on_stage("done", f"confidence={conf:.2f}")
         return AgentResult(content=content, confidence=conf, verified=True,
                            route="think", flags=[])
+
+    # --- Heavy (122B for complex coding/analysis) ---
+
+    def _run_heavy(self, query: str, context: str) -> AgentResult:
+        """Use the 122B model for complex tasks. Falls back to 35B if unavailable."""
+        has_heavy = hasattr(self.engine, 'generate_heavy')
+        if not has_heavy:
+            self.on_stage("fallback", "122B not available, using 35B...")
+            return self._run_think(query, context)
+
+        self.on_stage("heavy", "Loading 122B...")
+        user = f"Context:\n{context}\n\nQuery: {query}" if context else query
+        content = self.engine.generate_heavy(
+            "You are Kandiga, a powerful AI agent. Answer thoroughly and accurately. "
+            "For code: write complete, runnable implementations. "
+            "For analysis: be detailed and structured.",
+            user,
+        )
+
+        if not content or not content.strip():
+            self.on_stage("fallback", "122B empty, using 35B...")
+            return self._run_think(query, context)
+
+        conf = 0.92  # 122B gets highest local confidence
+        self.on_stage("done", f"confidence={conf:.2f} (122B)")
+        return AgentResult(content=content, confidence=conf, verified=True,
+                           route="heavy", flags=["122B"])
+
+    # --- Tool result 35B skip logic ---
+
+    @staticmethod
+    def _should_skip_35b(query: str, tool_results: list) -> bool:
+        """Check if tool results are self-explanatory (skip 35B synthesis)."""
+        if not tool_results:
+            return False
+        if any(not tr.success for tr in tool_results):
+            return False  # failures need 35B to explain
+        if len(tool_results) > 1:
+            return False  # multiple tools need synthesis
+
+        tr = tool_results[0]
+        # These tools return self-explanatory output
+        skip_tools = {"list_dir", "search_files", "write_file", "notify",
+                      "calendar_list", "reminders_list", "system_info", "say"}
+        if tr.tool in skip_tools:
+            return True
+        # read_file / run_shell: skip 35B unless query asks for reasoning
+        if tr.tool in ("read_file", "run_shell"):
+            q = query.lower()
+            reasoning_words = [
+                "explain", "summarize", "analyze", "what does", "why",
+                "how does", "total", "calculate", "compare", "find",
+            ]
+            if not any(w in q for w in reasoning_words):
+                return True
+        return False
 
     # --- Autonomous tool loop ---
 
@@ -721,7 +780,7 @@ class AgentPipeline:
             # 4B generates tool calls
             self.on_stage("fast", f"Step {iteration}: parsing tool calls...")
             user = f"Context:\n{step_ctx}\n\nTask: {query}" if step_ctx else query
-            raw = self._gen_fast(tool_system, user, max_tokens=1200)
+            raw = self._gen_fast(tool_system, user, max_tokens=200)
 
             parsed = parse_json(raw, defaults)
             calls = validate_tool_calls(parsed, self.registry.tool_names)
@@ -796,31 +855,30 @@ class AgentPipeline:
             for tr in all_results
         )
 
-        # 35B K=2 writes the response (fast but smart)
-        self.on_stage("brain-k2", "Writing response (35B K=2)...")
+        # Smart 35B skip: if tool result is self-explanatory, 4B formats directly
         synth_ctx = f"{context}\n\nTool results:\n{tool_output}" if context else f"Tool results:\n{tool_output}"
-        content = self._gen_brain(SYNTH_PROMPT, f"Context:\n{synth_ctx}\n\nQuery: {query}")
+        if self._should_skip_35b(query, all_results):
+            self.on_stage("fast", "4B formatting result...")
+            tr = all_results[0]
+            output = str(tr.output) if tr.output else ""
+            if tr.tool == "list_dir" or tr.tool == "search_files":
+                content = f"Contents:\n{output}"
+            elif tr.tool == "write_file":
+                content = f"File written successfully. {output}"
+            elif tr.tool == "notify" or tr.tool == "say":
+                content = output or "Done."
+            elif tr.tool in ("read_file", "run_shell"):
+                content = output[:3000] if output else "No output."
+            else:
+                content = output or "Done."
+        else:
+            # 35B K=4 writes the response
+            self.on_stage("brain", "Writing response (35B)...")
+            content = self._gen_brain(SYNTH_PROMPT, f"Context:\n{synth_ctx}\n\nQuery: {query}")
 
         conf, verified, flags = _verify(content, synth_ctx, all_results)
 
-        # 35B K=4 verifies if there were errors (Nightingale pattern)
-        if self._has_check and any(not tr.success for tr in all_results):
-            self.on_stage("brain-k4", "Verifying (35B K=4)...")
-            check = self.engine.generate_check(
-                "Check this response against the tool results. "
-                "If claims don't match tool output, reply with ONLY the corrected text. "
-                "If correct, reply: VERIFIED. "
-                "Do NOT add 'I cannot' or disclaimers.",
-                f"Tool results:\n{tool_output}\n\nResponse:\n{content}",
-            )
-            if check and "VERIFIED" not in check.upper()[:20]:
-                # Reject if it added refusal language
-                refusals = ["i cannot", "i can't", "i'm unable"]
-                if not any(r in check.lower() for r in refusals):
-                    content = check
-                    conf, verified, flags = _verify(content, synth_ctx, all_results)
-
-        # Cloud escalation if confidence is low and cloud is configured
+        # Cloud escalation FIRST if confidence is very low (skip K=4 — save 5s)
         if conf < (self._escalation_threshold or 0.3) and self._cloud:
             self.on_stage("cloud", f"Escalating to {self._cloud.provider}...")
             cloud_content = self._cloud.generate(
@@ -885,7 +943,7 @@ class AgentPipeline:
                 tool_raw = self._gen_fast(
                     TOOL_PROMPT.format(tool_descriptions=self.registry.describe_tools()),
                     f"Context:\n{step_ctx}\n\nTask: {step['description']}",
-                    max_tokens=1200,
+                    max_tokens=200,
                 )
                 step_parsed = parse_json(tool_raw, {"tool_calls": []})
                 step_calls = validate_tool_calls(step_parsed, self.registry.tool_names)
@@ -903,10 +961,14 @@ class AgentPipeline:
             else:
                 consecutive_errors = 0
 
-        # 35B K=2 writes the synthesis (smart + fast)
-        self.on_stage("brain-k2", "Writing response (35B K=2)...")
+        # Synthesize: skip 35B if all simple tools succeeded, else use 35B
         synth_ctx = f"{context}\n\nExecution results:\n{accumulated}" if context else f"Execution results:\n{accumulated}"
-        content = self._gen_brain(SYNTH_PROMPT, f"Context:\n{synth_ctx}\n\nQuery: {query}")
+        if self._should_skip_35b(query, all_results):
+            self.on_stage("fast", "4B formatting results...")
+            content = accumulated.strip()
+        else:
+            self.on_stage("brain", "Writing response (35B)...")
+            content = self._gen_brain(SYNTH_PROMPT, f"Context:\n{synth_ctx}\n\nQuery: {query}")
 
         conf, verified, flags = _verify(content, synth_ctx, all_results)
 
