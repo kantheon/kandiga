@@ -301,7 +301,7 @@ class AgentLoop:
         The 35B remembers ALL prior turns via KV cache.
         Turn 50 processes the same amount of new tokens as turn 1.
         """
-        message = f"Tool results for '{query}':\n{tool_summary}\n\nSummarize what was done."
+        message = f"User asked: {query}\n\nTool results:\n{tool_summary}\n\nAnswer the user's question directly based on these results. Be concise."
         brain = self.engine.brain if self._dual else self.engine
 
         if self._session_active and hasattr(brain, '_session_cache') and brain._session_cache is not None:
@@ -375,10 +375,11 @@ class AgentLoop:
         if not self._conversation:
             system_content = (
                 f"You are Kandiga, a local AI agent on the user's Mac. "
-                f"Home directory: {_HOME}. Always use full absolute paths. "
-                f"Use tools when the user's request requires accessing files, running commands, "
-                f"searching the web, or sending notifications. "
-                f"For general knowledge, math, creative writing, and conversation, respond directly. "
+                f"Home directory: {_HOME}. Always use full absolute paths.\n\n"
+                f"WHEN TO USE TOOLS: Only use tools when the user explicitly asks to "
+                f"read/write/list files, run commands, search the web, or send notifications.\n"
+                f"DO NOT USE TOOLS for: greetings (hello, hi, thanks, goodbye), math, "
+                f"general knowledge questions, creative writing, opinions, or conversation.\n\n"
                 f"If a tool returns an error, try a different approach. "
                 f"When the task is complete, respond with your final answer (no tool_call tags)."
             )
@@ -494,10 +495,11 @@ class AgentLoop:
             for tr in all_results
         )
 
-        # Skip 35B for simple results — only use 35B when truly needed
+        # Use 35B when results need reasoning or synthesis
         q_lower = query.lower()
         needs_reasoning = any(w in q_lower for w in [
-            "summarize", "analyze", "compare", "explain why",
+            "summarize", "analyze", "compare", "explain", "what does",
+            "what did", "how many", "total", "count",
         ])
 
         # Skip 35B if all tools succeeded and we don't need deep reasoning
