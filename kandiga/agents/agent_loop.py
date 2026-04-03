@@ -423,23 +423,34 @@ class AgentLoop:
                     # Strip path line if model included it
                     if content.startswith(path):
                         content = content[len(path):].strip()
-                    # Use 35B to improve code quality if it's a code file
-                    is_code = path.endswith(('.py', '.js', '.ts', '.sh', '.rb', '.go', '.rs'))
-                    if is_code and self._dual:
-                        brain = self.engine.brain if self._dual else self.engine
-                        if self._session_active and hasattr(brain, '_session_cache') and brain._session_cache is not None:
-                            self.on_stage("brain", "35B improving code...")
-                            better = []
-                            for tok in brain.session_generate(
-                                f"Write clean, working Python code (no markdown, no explanation, just code):\n{content}",
-                                max_tokens=500,
-                            ):
-                                better.append(tok)
-                            better_code = _strip_thinking("".join(better)).strip()
-                            better_code = re.sub(r'^```\w*\n?', '', better_code)
-                            better_code = re.sub(r'\n?```$', '', better_code).strip()
-                            if better_code and len(better_code) > 20:
-                                content = better_code
+                    # For Python files: syntax check before saving
+                    if path.endswith('.py'):
+                        try:
+                            compile(content, path, 'exec')
+                        except SyntaxError as e:
+                            # 4B code has syntax error — ask 35B to fix just the error
+                            if self._dual:
+                                brain = self.engine.brain if self._dual else self.engine
+                                if self._session_active and hasattr(brain, '_session_cache') and brain._session_cache is not None:
+                                    self.on_stage("brain", f"35B fixing: {e.msg} line {e.lineno}")
+                                    fix_tokens = []
+                                    for tok in brain.session_generate(
+                                        f"Fix this Python syntax error and return ONLY the corrected code, nothing else:\n"
+                                        f"Error: {e.msg} at line {e.lineno}\n\nCode:\n{content}",
+                                        max_tokens=500,
+                                    ):
+                                        fix_tokens.append(tok)
+                                    fixed = _strip_thinking("".join(fix_tokens)).strip()
+                                    fixed = re.sub(r'^```\w*\n?', '', fixed)
+                                    fixed = re.sub(r'\n?```$', '', fixed).strip()
+                                    # Verify the fix actually compiles
+                                    if fixed:
+                                        try:
+                                            compile(fixed, path, 'exec')
+                                            content = fixed
+                                            self.on_stage("brain", "Syntax fixed by 35B")
+                                        except SyntaxError:
+                                            pass  # 35B fix didn't help, use original
                     self.on_stage("auto-save", f"Saving to {path}")
                     tc = ToolCall(tool="write_file", args={"path": path, "content": content})
                     tr = self.registry.execute(tc)
@@ -469,27 +480,34 @@ class AgentLoop:
                 messages.append({"role": "user", "content": f"<tool_response>\nError: unknown tool '{name}'. Available: {', '.join(sorted(self.registry.tool_names))}\n</tool_response>"})
                 continue
 
-            # For write_file with code: use 35B to generate better content
-            if name == "write_file" and self._dual and args.get("content"):
+            # For write_file with Python: syntax check, 35B fixes errors
+            if name == "write_file" and args.get("content") and args.get("path", "").endswith('.py'):
                 content = args["content"]
-                path = args.get("path", "")
-                is_code = path.endswith(('.py', '.js', '.ts', '.sh', '.rb', '.go', '.rs'))
-                if is_code and len(content) > 10:
-                    self.on_stage("brain", "35B writing code...")
-                    brain = self.engine.brain if self._dual else self.engine
-                    if self._session_active and hasattr(brain, '_session_cache') and brain._session_cache is not None:
-                        better = []
-                        for tok in brain.session_generate(
-                            f"Write this code (no markdown, no explanation, just the code):\n{content}",
-                            max_tokens=500,
-                        ):
-                            better.append(tok)
-                        better_content = _strip_thinking("".join(better)).strip()
-                        # Strip markdown code fences if present
-                        better_content = re.sub(r'^```\w*\n?', '', better_content)
-                        better_content = re.sub(r'\n?```$', '', better_content).strip()
-                        if better_content and len(better_content) > len(content) // 2:
-                            args["content"] = better_content
+                path = args["path"]
+                try:
+                    compile(content, path, 'exec')
+                except SyntaxError as e:
+                    if self._dual:
+                        brain = self.engine.brain if self._dual else self.engine
+                        if self._session_active and hasattr(brain, '_session_cache') and brain._session_cache is not None:
+                            self.on_stage("brain", f"35B fixing: {e.msg} line {e.lineno}")
+                            fix_tokens = []
+                            for tok in brain.session_generate(
+                                f"Fix this Python syntax error and return ONLY the corrected code, nothing else:\n"
+                                f"Error: {e.msg} at line {e.lineno}\n\nCode:\n{content}",
+                                max_tokens=500,
+                            ):
+                                fix_tokens.append(tok)
+                            fixed = _strip_thinking("".join(fix_tokens)).strip()
+                            fixed = re.sub(r'^```\w*\n?', '', fixed)
+                            fixed = re.sub(r'\n?```$', '', fixed).strip()
+                            if fixed:
+                                try:
+                                    compile(fixed, path, 'exec')
+                                    args["content"] = fixed
+                                    self.on_stage("brain", "Syntax fixed by 35B")
+                                except SyntaxError:
+                                    pass
 
             self.on_stage("tool", f"{name}({json.dumps(args)[:60]})")
             tc = ToolCall(tool=name, args=args)
