@@ -95,10 +95,10 @@ StageCallback = Callable[[str, str], None]
 class LoopGuard:
     """Prevents infinite agent loops — repeated calls, no progress, budget exhaustion."""
 
-    def __init__(self, max_steps: int = 12, max_repeat: int = 3, max_flat: int = 4):
+    def __init__(self, max_steps: int = 12, max_repeat: int = 4, max_flat: int = 5):
         self.max_steps = max_steps
-        self.max_repeat = max_repeat
-        self.max_flat = max_flat
+        self.max_repeat = max_repeat  # same exact call (name+args) repeated this many times
+        self.max_flat = max_flat      # consecutive steps with no new information
         self.steps = 0
         self.flat_steps = 0
         self.seen: Dict[str, int] = {}
@@ -404,31 +404,36 @@ class AgentLoop:
             for tr in all_results
         )
 
-        # Skip 35B for simple single-tool results
+        # Skip 35B for simple results — only use 35B when truly needed
         q_lower = query.lower()
         needs_reasoning = any(w in q_lower for w in [
-            "total", "sum", "calculate", "most", "least", "biggest", "smallest",
-            "compare", "analyze", "explain", "summarize", "which", "how much",
-            "how many", "average", "best", "worst", "expensive", "cheap",
+            "summarize", "analyze", "compare", "explain why",
         ])
 
-        if len(all_results) == 1 and all_results[0].success and not needs_reasoning:
-            tr = all_results[0]
-            output = str(tr.output) if tr.output else ""
-            if tr.tool in ("list_dir", "search_files"):
-                return f"Contents:\n{output}"
-            elif tr.tool == "read_file":
-                return f"File contents:\n{output[:2000]}"
-            elif tr.tool == "run_shell":
-                return f"Output:\n{output[:2000]}"
-            elif tr.tool == "write_file":
-                return f"File written successfully. {output}"
-            elif tr.tool == "notify":
-                return output or "Notification sent."
-            elif tr.tool == "web_search":
-                self.on_stage("write", "Summarizing (35B)...")
-                return self._generate_response(query, tool_summary)
-            return output or "Done."
+        # Skip 35B if all tools succeeded and we don't need deep reasoning
+        successful = [tr for tr in all_results if tr.success]
+        if successful and not needs_reasoning and len(successful) == len(all_results):
+            # Format each tool result directly — no 35B needed
+            parts = []
+            for tr in all_results:
+                output = str(tr.output) if tr.output else ""
+                if tr.tool in ("list_dir", "search_files"):
+                    parts.append(output)
+                elif tr.tool == "read_file":
+                    parts.append(output[:2000])
+                elif tr.tool == "run_shell":
+                    parts.append(output[:2000])
+                elif tr.tool == "write_file":
+                    parts.append(output or "File written.")
+                elif tr.tool == "notify":
+                    parts.append(output or "Notification sent.")
+                elif tr.tool == "web_search":
+                    # Web search still needs 35B to summarize
+                    self.on_stage("write", "Summarizing (35B)...")
+                    return self._generate_response(query, tool_summary)
+                else:
+                    parts.append(output or "Done.")
+            return "\n".join(parts)
 
         # Multiple tools or failures — 35B synthesizes
         self.on_stage("write", "Writing response (35B)...")
