@@ -373,13 +373,17 @@ class AgentLoop:
 
         # First turn: build system prompt and start conversation
         if not self._conversation:
+            import datetime
+            now = datetime.datetime.now()
             system_content = (
-                f"You are Kandiga, a local AI agent on the user's Mac. "
-                f"Home directory: {_HOME}. Always use full absolute paths.\n\n"
+                f"You are Kandiga, a local AI agent on the user's Mac.\n"
+                f"Home directory: {_HOME}. Always use full absolute paths.\n"
+                f"Current time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}.\n"
+                f"System: macOS, Apple Silicon.\n\n"
                 f"WHEN TO USE TOOLS: Only use tools when the user explicitly asks to "
                 f"read/write/list files, run commands, search the web, or send notifications.\n"
-                f"DO NOT USE TOOLS for: greetings (hello, hi, thanks, goodbye), math, "
-                f"general knowledge questions, creative writing, opinions, or conversation.\n\n"
+                f"DO NOT USE TOOLS for: greetings, math, time/date questions, "
+                f"general knowledge, creative writing, opinions, or conversation.\n\n"
                 f"If a tool returns an error, try a different approach. "
                 f"When the task is complete, respond with your final answer (no tool_call tags)."
             )
@@ -433,6 +437,28 @@ class AgentLoop:
                 messages.append({"role": "assistant", "content": raw})
                 messages.append({"role": "user", "content": f"<tool_response>\nError: unknown tool '{name}'. Available: {', '.join(sorted(self.registry.tool_names))}\n</tool_response>"})
                 continue
+
+            # For write_file with code: use 35B to generate better content
+            if name == "write_file" and self._dual and args.get("content"):
+                content = args["content"]
+                path = args.get("path", "")
+                is_code = path.endswith(('.py', '.js', '.ts', '.sh', '.rb', '.go', '.rs'))
+                if is_code and len(content) > 10:
+                    self.on_stage("brain", "35B writing code...")
+                    brain = self.engine.brain if self._dual else self.engine
+                    if self._session_active and hasattr(brain, '_session_cache') and brain._session_cache is not None:
+                        better = []
+                        for tok in brain.session_generate(
+                            f"Write this code (no markdown, no explanation, just the code):\n{content}",
+                            max_tokens=500,
+                        ):
+                            better.append(tok)
+                        better_content = _strip_thinking("".join(better)).strip()
+                        # Strip markdown code fences if present
+                        better_content = re.sub(r'^```\w*\n?', '', better_content)
+                        better_content = re.sub(r'\n?```$', '', better_content).strip()
+                        if better_content and len(better_content) > len(content) // 2:
+                            args["content"] = better_content
 
             self.on_stage("tool", f"{name}({json.dumps(args)[:60]})")
             tc = ToolCall(tool=name, args=args)
