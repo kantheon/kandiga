@@ -376,21 +376,10 @@ class AgentLoop:
             import datetime
             now = datetime.datetime.now()
             system_content = (
-                f"You are Kandiga, a local AI agent on the user's Mac.\n"
-                f"Home directory: {_HOME}. Always use full absolute paths.\n"
-                f"Current time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}.\n"
-                f"System: macOS, Apple Silicon.\n\n"
-                f"WHEN TO USE TOOLS:\n"
-                f"- write_file: when user asks to CREATE or SAVE a file\n"
-                f"- read_file: when user asks to READ or SHOW a file\n"
-                f"- run_shell: when user asks to RUN, EXECUTE, DELETE, or get system info\n"
-                f"- list_dir: when user asks to LIST files in a directory\n"
-                f"- web_search: when user asks about current events, weather, news\n"
-                f"- notify: when user asks for a reminder or notification\n\n"
-                f"DO NOT USE TOOLS for: greetings, math, time/date questions, "
-                f"general knowledge, explaining concepts, opinions, or conversation.\n\n"
-                f"If a tool returns an error, try a different approach. "
-                f"When the task is complete, respond with your final answer (no tool_call tags)."
+                f"You are Kandiga, a helpful AI assistant running locally on the user's Mac.\n"
+                f"Home directory: {_HOME}\n"
+                f"Current time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}\n"
+                f"System: macOS, Apple Silicon"
             )
             if context:
                 system_content += f"\n\nContext: {context}"
