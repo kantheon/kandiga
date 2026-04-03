@@ -92,6 +92,58 @@ def _parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
     return {"name": name, "args": args}
 
 
+def _needs_heavy_model(query: str) -> bool:
+    """Detect queries that need the 122B model for quality."""
+    q = query.lower()
+    heavy_signals = [
+        "write a full", "build a", "implement a", "create a complete",
+        "write a program", "build me", "design a", "architect",
+        "write an api", "build an api", "create a server",
+        "write a class", "implement the", "build a full",
+        "complex", "production", "comprehensive",
+    ]
+    return any(s in q for s in heavy_signals)
+
+
+def _friendly_error(error: str) -> str:
+    """Convert raw tracebacks into user-friendly messages."""
+    if not error:
+        return "Something went wrong."
+    # Python errors
+    if "FileNotFoundError" in error or "No such file" in error:
+        path = re.search(r"'([^']+)'", error)
+        return f"File not found: {path.group(1) if path else 'unknown path'}"
+    if "PermissionError" in error or "Permission denied" in error:
+        return "Permission denied. Try with a different path or check file permissions."
+    if "SyntaxError" in error:
+        line = re.search(r"line (\d+)", error)
+        return f"Code has a syntax error{' on line ' + line.group(1) if line else ''}."
+    if "NameError" in error:
+        name = re.search(r"name '(\w+)'", error)
+        return f"Code error: '{name.group(1) if name else 'variable'}' is not defined."
+    if "TypeError" in error:
+        return "Code error: wrong type or wrong number of arguments."
+    if "ModuleNotFoundError" in error:
+        mod = re.search(r"No module named '(\w+)'", error)
+        return f"Missing module: {mod.group(1) if mod else 'unknown'}. Try installing it."
+    if "TimeoutError" in error or "timed out" in error.lower():
+        return "The command timed out. Try a simpler approach."
+    if "ConnectionError" in error or "Network" in error.lower():
+        return "Network error. Check your internet connection."
+    # Shell errors
+    if "command not found" in error.lower():
+        cmd = re.search(r"(\w+): command not found", error)
+        return f"Command '{cmd.group(1) if cmd else 'unknown'}' not found."
+    # Default: first meaningful line
+    lines = [l.strip() for l in error.strip().split('\n') if l.strip()]
+    if lines:
+        # Skip traceback lines, find the actual error
+        for line in reversed(lines):
+            if not line.startswith(("Traceback", "File ", "  ")):
+                return line
+    return error[:200]
+
+
 def _needs_multi_tool(query: str) -> bool:
     """Check if query likely needs multiple tool calls (multi-step)."""
     q = query.lower()
@@ -169,6 +221,7 @@ class AgentLoop:
         self.max_iterations = max_iterations
         self.on_stage = on_stage or (lambda *_: None)
         self._dual = hasattr(engine, 'generate_fast') and hasattr(engine, 'generate_brain')
+        self._has_heavy = hasattr(engine, 'generate_heavy')
         self._tool_defs = _build_tool_defs(self.registry)
 
         # Get the tokenizer
@@ -423,6 +476,21 @@ class AgentLoop:
                     # Strip path line if model included it
                     if content.startswith(path):
                         content = content[len(path):].strip()
+
+                    # For heavy coding tasks: use 122B if available
+                    is_code = path.endswith(('.py', '.js', '.ts', '.sh', '.rb', '.go', '.rs'))
+                    if is_code and self._has_heavy and _needs_heavy_model(query):
+                        self.on_stage("heavy", "122B writing code...")
+                        heavy_content = self.engine.generate_heavy(
+                            "Write clean, production-quality code. Return ONLY the code, no markdown, no explanation.",
+                            f"Write this: {query}\n\nFile: {path}",
+                        )
+                        heavy_content = _strip_thinking(heavy_content).strip()
+                        heavy_content = re.sub(r'^```\w*\n?', '', heavy_content)
+                        heavy_content = re.sub(r'\n?```$', '', heavy_content).strip()
+                        if heavy_content and len(heavy_content) > 20:
+                            content = heavy_content
+                            flags.append("122B")
                     # For Python files: syntax check before saving
                     if path.endswith('.py'):
                         try:
@@ -568,7 +636,12 @@ class AgentLoop:
                 response = self._build_response(query, "", all_results)
                 return self._finish(query, response, all_results, t_start, flags)
 
-            output = str(tr.output) if tr.output else (tr.error or "")
+            if tr.success:
+                output = str(tr.output) if tr.output else "(no output)"
+            else:
+                # Friendly error for the user
+                raw_error = str(tr.error or tr.output or "Unknown error")
+                output = _friendly_error(raw_error)
             if len(output) > 2000:
                 lines = output.split('\n')
                 if len(lines) > 20:
@@ -611,7 +684,7 @@ class AgentLoop:
 
         tool_summary = "\n".join(
             f"[{tr.tool}] {'OK' if tr.success else 'FAIL'}: "
-            f"{str(tr.output)[:300] if tr.output else tr.error or ''}"
+            f"{str(tr.output)[:300] if tr.output else _friendly_error(tr.error or '')}"
             for tr in all_results
         )
 
