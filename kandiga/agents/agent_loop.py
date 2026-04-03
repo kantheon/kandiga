@@ -423,6 +423,23 @@ class AgentLoop:
                     # Strip path line if model included it
                     if content.startswith(path):
                         content = content[len(path):].strip()
+                    # Use 35B to improve code quality if it's a code file
+                    is_code = path.endswith(('.py', '.js', '.ts', '.sh', '.rb', '.go', '.rs'))
+                    if is_code and self._dual:
+                        brain = self.engine.brain if self._dual else self.engine
+                        if self._session_active and hasattr(brain, '_session_cache') and brain._session_cache is not None:
+                            self.on_stage("brain", "35B improving code...")
+                            better = []
+                            for tok in brain.session_generate(
+                                f"Write clean, working Python code (no markdown, no explanation, just code):\n{content}",
+                                max_tokens=500,
+                            ):
+                                better.append(tok)
+                            better_code = _strip_thinking("".join(better)).strip()
+                            better_code = re.sub(r'^```\w*\n?', '', better_code)
+                            better_code = re.sub(r'\n?```$', '', better_code).strip()
+                            if better_code and len(better_code) > 20:
+                                content = better_code
                     self.on_stage("auto-save", f"Saving to {path}")
                     tc = ToolCall(tool="write_file", args={"path": path, "content": content})
                     tr = self.registry.execute(tc)
