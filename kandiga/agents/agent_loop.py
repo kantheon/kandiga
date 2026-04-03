@@ -512,6 +512,51 @@ class AgentLoop:
             self.on_stage("tool", f"{name}({json.dumps(args)[:60]})")
             tc = ToolCall(tool=name, args=args)
             tr = self.registry.execute(tc)
+
+            # Runtime error on Python script → 35B fixes the code and reruns
+            if not tr.success and name == "run_shell" and self._dual:
+                cmd = args.get("command", "")
+                # Detect Python script execution
+                py_match = re.search(r'python3?\s+(/[\w./]+\.py)', cmd)
+                if py_match:
+                    script_path = py_match.group(1)
+                    error_output = str(tr.error or tr.output or "")
+                    try:
+                        with open(script_path) as f:
+                            code = f.read()
+                    except Exception:
+                        code = None
+
+                    if code and error_output:
+                        brain = self.engine.brain if self._dual else self.engine
+                        if self._session_active and hasattr(brain, '_session_cache') and brain._session_cache is not None:
+                            self.on_stage("brain", f"35B fixing runtime error...")
+                            fix_tokens = []
+                            for tok in brain.session_generate(
+                                f"Fix this Python code. Return ONLY the corrected code, no explanation:\n\n"
+                                f"Error: {error_output[:500]}\n\nCode:\n{code}",
+                                max_tokens=500,
+                            ):
+                                fix_tokens.append(tok)
+                            fixed = _strip_thinking("".join(fix_tokens)).strip()
+                            fixed = re.sub(r'^```\w*\n?', '', fixed)
+                            fixed = re.sub(r'\n?```$', '', fixed).strip()
+
+                            if fixed and len(fixed) > 20:
+                                # Verify it at least compiles
+                                try:
+                                    compile(fixed, script_path, 'exec')
+                                    # Save the fix and rerun
+                                    with open(script_path, 'w') as f:
+                                        f.write(fixed)
+                                    self.on_stage("brain", "Code fixed, rerunning...")
+                                    tr2 = self.registry.execute(tc)
+                                    if tr2.success:
+                                        tr = tr2  # use the successful result
+                                        self.on_stage("result", "35B fix worked!")
+                                except SyntaxError:
+                                    pass  # 35B fix has syntax error, keep original failure
+
             all_results.append(tr)
 
             # LoopGuard: check progress
