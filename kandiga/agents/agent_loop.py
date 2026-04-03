@@ -378,9 +378,12 @@ class AgentLoop:
             status = "OK" if tr.success else "FAILED"
             self.on_stage("result", f"{name}: {status}")
 
-            # Feed back in native format
+            # Feed back in native format with explicit status
             messages.append({"role": "assistant", "content": raw})
-            messages.append({"role": "user", "content": f"<tool_response>\n{output}\n</tool_response>"})
+            if tr.success:
+                messages.append({"role": "user", "content": f"<tool_response>\n{status}: {output}\n</tool_response>\nThe tool executed successfully. Now give your final answer to the user based on this result. Do NOT call the same tool again."})
+            else:
+                messages.append({"role": "user", "content": f"<tool_response>\n{status}: {output}\n</tool_response>\nThe tool failed. Try a different approach or explain the error to the user."})
 
             # Budget warning when running low
             if guard.remaining <= 2:
