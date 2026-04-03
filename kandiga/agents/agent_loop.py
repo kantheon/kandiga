@@ -376,10 +376,9 @@ class AgentLoop:
             import datetime
             now = datetime.datetime.now()
             system_content = (
-                f"You are Kandiga, a helpful AI assistant running locally on the user's Mac.\n"
-                f"Home directory: {_HOME}\n"
-                f"Current time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}\n"
-                f"System: macOS, Apple Silicon"
+                f"You are a helpful assistant. "
+                f"Home: {_HOME}. "
+                f"Time: {now.strftime('%I:%M %p, %b %d %Y')}."
             )
             if context:
                 system_content += f"\n\nContext: {context}"
@@ -411,6 +410,27 @@ class AgentLoop:
             tool_call = _parse_tool_call(raw)
 
             if not tool_call:
+                # Check: did the model generate code for a file but not call write_file?
+                # Pattern: user says "create/write X file" but model shows code instead of calling tool
+                clean_raw = re.sub(r'</?(?:tool_call|function|parameter)[^>]*>', '', raw).strip()
+                q_lower = query.lower()
+                wants_file = any(w in q_lower for w in ["create a file", "write a file", "save a file", "create file", "write file", "save file", "write to", "save to"])
+                has_path = re.search(r'(/[\w./]+\.\w+)', query)
+                if wants_file and has_path and not all_results and clean_raw:
+                    # Model showed the code — auto-save it
+                    path = has_path.group(1)
+                    content = clean_raw
+                    # Strip path line if model included it
+                    if content.startswith(path):
+                        content = content[len(path):].strip()
+                    self.on_stage("auto-save", f"Saving to {path}")
+                    tc = ToolCall(tool="write_file", args={"path": path, "content": content})
+                    tr = self.registry.execute(tc)
+                    all_results.append(tr)
+                    if tr.success:
+                        response = f"Created {path} ({len(content)} bytes)"
+                        return self._finish(query, response, all_results, t_start, flags + ["auto-saved"])
+
                 # No tool call — model is giving final answer
                 response = self._build_response(query, raw, all_results)
                 return self._finish(query, response, all_results, t_start, flags)
