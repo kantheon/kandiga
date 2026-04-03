@@ -70,13 +70,23 @@ def _parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
     name = match.group(1)
     params_block = match.group(2)
 
+    # Extract parameters — handle missing </parameter> closing tags
+    # The model sometimes generates <parameter=path>value<parameter=content>
+    # instead of <parameter=path>value</parameter><parameter=content>
     args = {}
-    for param_match in re.finditer(
-        r'<parameter=(\w+)>\s*(.*?)\s*</parameter>',
-        params_block, re.DOTALL,
-    ):
-        key = param_match.group(1)
-        value = param_match.group(2).strip()
+    param_starts = list(re.finditer(r'<parameter=(\w+)>\s*', params_block))
+    for i, pm in enumerate(param_starts):
+        key = pm.group(1)
+        start = pm.end()
+        # Value ends at next <parameter= or </parameter> or </function>, whichever comes first
+        if i + 1 < len(param_starts):
+            end = param_starts[i + 1].start()
+        else:
+            end_match = re.search(r'</(?:parameter|function)>', params_block[start:])
+            end = start + end_match.start() if end_match else len(params_block)
+        value = params_block[start:end].strip()
+        # Strip trailing </parameter> if present
+        value = re.sub(r'\s*</parameter>\s*$', '', value).strip()
         args[key] = value
 
     return {"name": name, "args": args}
