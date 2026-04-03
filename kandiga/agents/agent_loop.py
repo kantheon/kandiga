@@ -180,7 +180,7 @@ class AgentLoop:
         # Session state
         self._session_active = False
         self._4b_cache = None          # Persistent KV cache for 4B
-        self._4b_tokens_fed = 0        # How many tokens already in the 4B cache
+        self._4b_tokens_fed = []       # Exact token IDs already in the 4B cache
         # Recent files/paths used — injected as context for follow-ups
         self._recent_paths: List[str] = []
         self._last_query = ""
@@ -198,7 +198,7 @@ class AgentLoop:
         # 4B session — create persistent KV cache
         if self._dual:
             self._4b_cache = self.engine._struct_model.make_cache()
-            self._4b_tokens_fed = 0
+            self._4b_tokens_fed = []
             self.on_stage("session", "KV cache active on 4B + 35B")
         else:
             self.on_stage("session", "KV cache active")
@@ -210,7 +210,7 @@ class AgentLoop:
         if hasattr(brain, 'end_session'):
             brain.end_session()
         self._4b_cache = None
-        self._4b_tokens_fed = 0
+        self._4b_tokens_fed = []
         self._session_active = False
         self._conversation = []
 
@@ -235,54 +235,61 @@ class AgentLoop:
             )
 
         if self._dual:
-            from mlx_lm.generate import make_sampler
             model = self.engine._struct_model
-            sampler = make_sampler(temp=0.0)
 
             # Tokenize full prompt
-            all_tokens = mx.array(self._tokenizer.encode(formatted))
+            all_token_ids = self._tokenizer.encode(formatted)
 
-            # Use persistent KV cache if available
-            if self._4b_cache is not None and self._4b_tokens_fed > 0:
-                # Only feed NEW tokens (everything after what's already cached)
-                new_tokens = all_tokens[self._4b_tokens_fed:]
-                if new_tokens.size == 0:
-                    new_tokens = all_tokens[-1:]  # at least one token
+            # Use persistent KV cache — only feed tokens not yet cached
+            if self._4b_cache is not None and self._4b_tokens_fed:
+                # Find where new tokens start by comparing with cached tokens
+                # The cached tokens are a prefix of all_token_ids
+                prefix_len = len(self._4b_tokens_fed)
+                # Verify alignment — if prefix matches, only feed the rest
+                if all_token_ids[:prefix_len] == self._4b_tokens_fed:
+                    new_ids = all_token_ids[prefix_len:]
+                else:
+                    # Misalignment — reset cache and start fresh
+                    self._4b_cache = model.make_cache()
+                    new_ids = all_token_ids
             else:
-                new_tokens = all_tokens
                 if self._4b_cache is None:
                     self._4b_cache = model.make_cache()
+                new_ids = all_token_ids
+
+            if not new_ids:
+                new_ids = all_token_ids[-1:]  # at least one token
 
             # Prefill new tokens
-            new_input = new_tokens.reshape(1, -1)
+            new_input = mx.array(new_ids).reshape(1, -1)
             logits = model(new_input, cache=self._4b_cache)
             mx.eval(logits)
 
-            # Update token count
-            self._4b_tokens_fed = all_tokens.size
+            # Track what's been fed
+            self._4b_tokens_fed = list(all_token_ids)
 
             # Decode loop with stop at </tool_call>
             result = ""
+            generated_ids = []
             token = mx.argmax(logits[:, -1, :], axis=-1)
             for _ in range(max_tokens):
-                token_str = self._tokenizer.decode(token.tolist())
+                tid = token.item()
+                generated_ids.append(tid)
+                token_str = self._tokenizer.decode([tid])
                 result += token_str
 
-                # Stop conditions
                 if "</tool_call>" in result:
-                    idx = result.index("</tool_call>") + len("</tool_call>")
-                    result = result[:idx]
+                    result = result[:result.index("</tool_call>") + len("</tool_call>")]
                     break
-                if token.item() == self._tokenizer.eos_token_id:
+                if tid == self._tokenizer.eos_token_id:
                     break
 
-                # Next token
                 logits = model(token.reshape(1, 1), cache=self._4b_cache)
                 mx.eval(logits)
                 token = mx.argmax(logits[:, -1, :], axis=-1)
 
-                # Track generated tokens in cache
-                self._4b_tokens_fed += 1
+            # Add generated tokens to the tracked cache
+            self._4b_tokens_fed.extend(generated_ids)
 
             return result
         else:
