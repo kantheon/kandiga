@@ -179,31 +179,51 @@ class AgentLoop:
 
         # Session state
         self._session_active = False
+        self._4b_cache = None          # Persistent KV cache for 4B
+        self._4b_tokens_fed = 0        # How many tokens already in the 4B cache
         # Recent files/paths used — injected as context for follow-ups
         self._recent_paths: List[str] = []
         self._last_query = ""
         self._last_response = ""
+        # Conversation history for multi-turn (messages accumulate)
+        self._conversation: List[Dict] = []
 
     def start_session(self):
-        """Start persistent KV cache session on the 35B."""
+        """Start persistent KV cache session on both 4B and 35B."""
+        # 35B brain session
         brain = self.engine.brain if self._dual else self.engine
         if hasattr(brain, 'start_session'):
             brain.start_session()
-            self._session_active = True
-            self.on_stage("session", "KV cache active — follow-ups are instant")
+
+        # 4B session — create persistent KV cache
+        if self._dual:
+            self._4b_cache = self.engine._struct_model.make_cache()
+            self._4b_tokens_fed = 0
+            self.on_stage("session", "KV cache active on 4B + 35B")
+        else:
+            self.on_stage("session", "KV cache active")
+        self._session_active = True
+        self._conversation = []
 
     def end_session(self):
         brain = self.engine.brain if self._dual else self.engine
         if hasattr(brain, 'end_session'):
             brain.end_session()
-            self._session_active = False
+        self._4b_cache = None
+        self._4b_tokens_fed = 0
+        self._session_active = False
+        self._conversation = []
 
     def _format_and_generate(self, messages: List[Dict], max_tokens: int = 150) -> str:
-        """Format messages with native tool template and generate.
+        """Format messages and generate using persistent KV cache.
 
-        Stops generation after first </tool_call> to prevent
-        repeated calls and false positives after direct answers.
+        The 4B model maintains a KV cache across turns so it remembers
+        previous tool calls and results. Only NEW tokens are processed
+        each turn — turn 10 is as fast as turn 1.
+
+        Stops generation after first </tool_call>.
         """
+        import mlx.core as mx
         try:
             formatted = self._tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
@@ -215,24 +235,55 @@ class AgentLoop:
             )
 
         if self._dual:
-            from mlx_lm import stream_generate
             from mlx_lm.generate import make_sampler
-            # Stream and stop at first </tool_call> or </function>
+            model = self.engine._struct_model
+            sampler = make_sampler(temp=0.0)
+
+            # Tokenize full prompt
+            all_tokens = mx.array(self._tokenizer.encode(formatted))
+
+            # Use persistent KV cache if available
+            if self._4b_cache is not None and self._4b_tokens_fed > 0:
+                # Only feed NEW tokens (everything after what's already cached)
+                new_tokens = all_tokens[self._4b_tokens_fed:]
+                if new_tokens.size == 0:
+                    new_tokens = all_tokens[-1:]  # at least one token
+            else:
+                new_tokens = all_tokens
+                if self._4b_cache is None:
+                    self._4b_cache = model.make_cache()
+
+            # Prefill new tokens
+            new_input = new_tokens.reshape(1, -1)
+            logits = model(new_input, cache=self._4b_cache)
+            mx.eval(logits)
+
+            # Update token count
+            self._4b_tokens_fed = all_tokens.size
+
+            # Decode loop with stop at </tool_call>
             result = ""
-            for resp in stream_generate(
-                self.engine._struct_model, self._tokenizer,
-                prompt=formatted, max_tokens=max_tokens,
-                sampler=make_sampler(temp=0.0),
-            ):
-                result += resp.text
-                # Stop after first complete tool call
+            token = mx.argmax(logits[:, -1, :], axis=-1)
+            for _ in range(max_tokens):
+                token_str = self._tokenizer.decode(token.tolist())
+                result += token_str
+
+                # Stop conditions
                 if "</tool_call>" in result:
-                    # Keep everything up to and including </tool_call>
                     idx = result.index("</tool_call>") + len("</tool_call>")
                     result = result[:idx]
                     break
-                if resp.finish_reason:
+                if token.item() == self._tokenizer.eos_token_id:
                     break
+
+                # Next token
+                logits = model(token.reshape(1, 1), cache=self._4b_cache)
+                mx.eval(logits)
+                token = mx.argmax(logits[:, -1, :], axis=-1)
+
+                # Track generated tokens in cache
+                self._4b_tokens_fed += 1
+
             return result
         else:
             return self.engine.generate(formatted, max_tokens=max_tokens, temp=0.0, stream=False)
@@ -303,33 +354,38 @@ class AgentLoop:
         return fixed.strip()
 
     def run(self, query: str, context: str = "") -> AgentResult:
-        """Run the native tool-calling loop with production-quality guardrails."""
+        """Run the native tool-calling loop with production-quality guardrails.
+
+        Uses persistent KV cache — the 4B model remembers all previous turns.
+        Only new tokens are processed each turn.
+        """
         t_start = time.time()
         query = query.replace("~/", f"{_HOME}/").replace("~ ", f"{_HOME} ")
         guard = LoopGuard(max_steps=self.max_iterations)
         flags: List[str] = []
 
-        # Build system prompt
-        system_content = (
-            f"You are Kandiga, a local AI agent on the user's Mac. "
-            f"Home directory: {_HOME}. Always use full absolute paths. "
-            f"Use tools when the user's request requires accessing files, running commands, "
-            f"searching the web, or sending notifications. "
-            f"For general knowledge, math, creative writing, and conversation, respond directly. "
-            f"If a tool returns an error, try a different approach. "
-            f"When the task is complete, respond with your final answer (no tool_call tags)."
-        )
-        if context:
-            system_content += f"\n\nContext: {context}"
-        if self._recent_paths:
-            system_content += f"\n\nRecent files used: {', '.join(self._recent_paths[-5:])}"
-        if self._last_query and self._last_response:
-            system_content += f"\n\nPrevious turn:\nUser: {self._last_query[:200]}\nAgent: {self._last_response[:200]}"
+        # First turn: build system prompt and start conversation
+        if not self._conversation:
+            system_content = (
+                f"You are Kandiga, a local AI agent on the user's Mac. "
+                f"Home directory: {_HOME}. Always use full absolute paths. "
+                f"Use tools when the user's request requires accessing files, running commands, "
+                f"searching the web, or sending notifications. "
+                f"For general knowledge, math, creative writing, and conversation, respond directly. "
+                f"If a tool returns an error, try a different approach. "
+                f"When the task is complete, respond with your final answer (no tool_call tags)."
+            )
+            if context:
+                system_content += f"\n\nContext: {context}"
+            self._conversation = [
+                {"role": "system", "content": system_content},
+            ]
 
-        messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": query},
-        ]
+        # Add user message to persistent conversation
+        self._conversation.append({"role": "user", "content": query})
+
+        # Working messages = full conversation (KV cache handles the efficiency)
+        messages = list(self._conversation)
 
         all_results: List[ToolResult] = []
 
@@ -477,6 +533,9 @@ class AgentLoop:
             conf = 0.50
         else:
             conf = 0.85
+
+        # Add assistant response to persistent conversation for multi-turn
+        self._conversation.append({"role": "assistant", "content": response[:500]})
 
         # Track for follow-ups
         self._last_query = query
