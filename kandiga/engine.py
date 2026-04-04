@@ -775,9 +775,11 @@ class KandigaEngine:
         model_path: str | None = None,
         fast_mode: bool = False,
         log_memory: bool = False,
+        vision: bool = False,
     ):
         self.model_path = model_path or self.DEFAULT_MODEL
         self.fast_mode = fast_mode
+        self.vision = vision
         self._log_memory = log_memory
         self._model = None
         self._tokenizer = None
@@ -840,7 +842,8 @@ class KandigaEngine:
             try:
                 from mlx_vlm import load as vlm_load
                 _vlm_model, _vlm_proc = vlm_load(self.model_path, lazy=True)
-                # Wrap the language model so __call__ returns raw logits
+                # Keep full model (vision + language) for multimodal support
+                # Wrap __call__ on the language model to return raw logits
                 # (mlx_lm.generate expects tensor output, not LanguageModelOutput)
                 lm = _vlm_model.language_model if hasattr(_vlm_model, 'language_model') else _vlm_model
                 _orig_call = lm.__class__.__call__
@@ -848,7 +851,12 @@ class KandigaEngine:
                     out = _orig_call(self_inner, *args, **kwargs)
                     return out.logits if hasattr(out, 'logits') else out
                 lm.__class__.__call__ = _logits_call
+                # Use language model for text generation (SEM wraps experts here)
+                # but store the full model for vision access
                 self._model = lm
+                self._vlm_model = _vlm_model  # keep for vision
+                self._vlm_processor = _vlm_proc
+                self._orig_lm_call = _orig_call  # save for vision (mlx_vlm needs LanguageModelOutput)
                 self._tokenizer = _vlm_proc.tokenizer if hasattr(_vlm_proc, 'tokenizer') else _vlm_proc
                 self._log("Model structure loaded via mlx-vlm (Gemma 4)")
             except ImportError:
@@ -979,6 +987,19 @@ class KandigaEngine:
         if shared:
             mx.eval(*shared)
         self._log("Shared parameters loaded to GPU")
+
+        # Step 5 (vision): Load vision encoder + projector to GPU for Gemma 4
+        # Only when vision=True — saves ~1.1 GB GPU when off (default)
+        if self.vision and hasattr(self, '_vlm_model') and self._vlm_model is not None:
+            vision_params = []
+            for name in ['vision_tower', 'embed_vision', 'embed_audio']:
+                component = getattr(self._vlm_model, name, None)
+                if component is not None:
+                    vision_params.extend(v for _, v in tree_flatten(component.parameters()))
+            if vision_params:
+                mx.eval(*vision_params)
+                vision_mb = sum(v.nbytes for v in vision_params) / 1e6
+                self._log(f"Vision encoder loaded to GPU ({vision_mb:.0f} MB)")
 
         # Step 5a: Free lazy expert weight mmap pages from safetensors.
         # Expert weights come from our packed binary files (pread), not safetensors.
@@ -1231,6 +1252,59 @@ class KandigaEngine:
                 verbose=False,
             )
             return _strip_thinking(response)
+
+    def generate_with_image(
+        self,
+        image_path: str,
+        prompt: str = "Describe this image in detail.",
+        max_tokens: int = 500,
+        temp: float = 0.0,
+    ) -> str:
+        """Generate a response given an image + text prompt (Gemma 4 vision via SEM).
+
+        Vision encoder runs on GPU (~1.1 GB), language model uses SEM for experts.
+        Total GPU: ~2.7 GB (vision + shared language layers).
+        """
+        if not self._ready:
+            self.load()
+
+        vlm_model = getattr(self, '_vlm_model', None)
+        vlm_proc = getattr(self, '_vlm_processor', None)
+        orig_call = getattr(self, '_orig_lm_call', None)
+        if vlm_model is None or vlm_proc is None:
+            raise RuntimeError("Vision not available — requires Gemma 4 loaded via mlx-vlm")
+
+        from mlx_vlm import generate as vlm_generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm.utils import load_image
+
+        image = [load_image(image_path)]
+        formatted = apply_chat_template(
+            vlm_proc,
+            config=vlm_model.config,
+            prompt=prompt,
+            num_images=1,
+        )
+
+        # Temporarily restore original __call__ — mlx_vlm.generate_step
+        # calls model.language_model() directly and expects LanguageModelOutput
+        # (with .logits attribute), not raw logits tensor
+        lm_class = self._model.__class__
+        wrapped_call = lm_class.__call__
+        if orig_call is not None:
+            lm_class.__call__ = orig_call
+
+        try:
+            result = vlm_generate(
+                vlm_model, vlm_proc, formatted, image,
+                max_tokens=max_tokens, temperature=temp, verbose=True,
+            )
+        finally:
+            # Restore the logits wrapper for normal text generation
+            if orig_call is not None:
+                lm_class.__call__ = wrapped_call
+
+        return result.text if hasattr(result, 'text') else str(result)
 
     # ------------------------------------------------------------------
     # Persistent KV cache for multi-turn conversations

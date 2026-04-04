@@ -259,4 +259,12 @@ def default_tools() -> ToolRegistry:
 
         reg.register("web_search", "Search the web for current information like weather, news, prices, sports scores, or any real-time data", {"query": "str"}, web_search)
         reg.register("read_webpage", "Fetch and read the text content of a specific URL", {"url": "str"}, read_webpage)
+
+    # Vision tools — analyze images, screenshots
+    try:
+        from kandiga.agents.vision import register_vision_tools
+        register_vision_tools(reg)
+    except ImportError:
+        pass
+
     return reg
