@@ -175,6 +175,30 @@ TQ3 (TurboQuant 3-bit) applies Walsh-Hadamard Transform rotation before quantiza
 
 For production: use `mx.quantize(bits=3)` (MLX native). TQ3 WHT rotation is for research/future optimization.
 
+### Vision
+
+Gemma 4 26B-A4B and Qwen 3.5 4B support image analysis:
+
+- **Gemma 4 vision via SEM**: Vision encoder on GPU (~1.1 GB) + shared language layers (~1.6 GB) + experts from SSD. Total: 3.5 GB peak. Enable with `vision=True` (default off to save RAM).
+- **Qwen 3.5 4B**: Natively multimodal. Loads on-demand when `analyze_image` tool is called. 36.6 tok/s, 4 GB.
+- Agent tools: `analyze_image(path, question)`, `screenshot_analyze(question)`
+
+### Research: MoE Expert Routing Analysis
+
+Empirical analysis of expert selection patterns across 40 MoE layers, 256 experts/layer, K=8 (Qwen 3.5 35B-A3B, 249 tokens across 8 prompts):
+
+**Finding 1: Cross-layer expert indices are random.** Adjacent layers share experts at 1.07x random chance (Jaccard 0.017 vs 0.016 expected). Layer distance doesn't matter — layers 20 apart are equally uncorrelated.
+
+**Finding 2: Hidden state prediction works despite random indices.** Cross-layer speculation achieves 77% accuracy by predicting from `hidden_state × next_gate_weights`. The hidden representation carries enough information to predict routing even though expert *identities* are completely independent across layers.
+
+**Finding 3: Router distributions are extremely diffuse.** Top-8 experts capture only 15.7% of total probability mass. Entropy averages 7.5/8.0 bits (near-uniform). Adaptive K via confidence thresholding is not viable for this architecture.
+
+**Finding 4: Deeper layers specialize more.** Gini coefficient rises from 0.38 (layer 0) to 0.62 (layer 20). Early layers use 250/256 experts; deep layers use ~175/256.
+
+**Finding 5: Cross-token expert caching shows 35% hit rate.** Consecutive tokens reuse 35% of experts within the same layer. Deep layers hit 48%. Estimated 1.5x speedup (12→18 tok/s) with 420 MB cache. Implementation pending.
+
+Scripts: `scripts/experiment_expert_v2.py`, `scripts/experiment_cross_token_cache.py`
+
 ## File Structure
 
 ```
