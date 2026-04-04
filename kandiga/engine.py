@@ -833,6 +833,13 @@ class KandigaEngine:
             self._log("Dense model loaded (all weights in memory)")
             self._cpu_lib = None
             self._cpu_engine = None
+            # TurboQuant KV compression — works on dense models too
+            try:
+                from kandiga.kv_compress import install_kv_compression
+                n = install_kv_compression(self._model)
+                self._log(f"TurboQuant KV compression active ({n} layers)")
+            except Exception as e:
+                self._log(f"TurboQuant: {e}")
             self._ready = True
             return
 
