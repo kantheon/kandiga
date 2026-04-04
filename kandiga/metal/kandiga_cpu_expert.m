@@ -35,7 +35,6 @@
 /* Model constants (must match packed binary format)                         */
 /* ----------------------------------------------------------------------- */
 #define MAX_EXPERTS     16
-#define MAX_CACHE_LAYERS 64
 #define HIDDEN_SIZE     2048
 #define EXPERT_DIM      512
 #define GROUP_SIZE      64
@@ -74,17 +73,6 @@ typedef struct {
     int     bits;          /* 3 or 4 — auto-detected from header */
     size_t  expert_size;   /* bytes per expert block */
     char*   expert_bufs[MAX_EXPERTS];
-
-    /* Cross-token expert cache: per-layer, stores last K experts' raw data.
-     * On cache hit (same expert_id as previous token), memcpy from cache
-     * instead of pread from disk. 35% average hit rate measured empirically.
-     * Memory: num_layers × K × expert_size (~420 MB for 40-layer 3-bit). */
-    int     cache_ids[MAX_CACHE_LAYERS][MAX_EXPERTS]; /* cached expert IDs, -1=empty */
-    char*   cache_data[MAX_CACHE_LAYERS][MAX_EXPERTS]; /* cached expert bytes */
-    int     cache_count[MAX_CACHE_LAYERS];             /* num cached per layer */
-    int     cache_enabled;
-    uint64_t cache_hits;
-    uint64_t cache_misses;
 } KandigaCPUExpertEngine;
 
 /* ----------------------------------------------------------------------- */
@@ -470,34 +458,9 @@ void* bakan_cpu_expert_init(const char* packed_dir, int num_layers) {
         }
     }
 
-    /* Initialize cross-token expert cache */
-    /* Cache disabled by default — OS page cache already handles cross-token
-     * expert reuse (~35% hit rate measured). Explicit cache adds memcpy overhead
-     * that outweighs savings on fast storage. Enable with KANDIGA_EXPERT_CACHE=1
-     * for systems under memory pressure or with slow storage. */
-    engine->cache_enabled = (getenv("KANDIGA_EXPERT_CACHE") != NULL) ? 1 : 0;
-    engine->cache_hits = 0;
-    engine->cache_misses = 0;
-    for (int l = 0; l < MAX_CACHE_LAYERS && l < num_layers; l++) {
-        engine->cache_count[l] = 0;
-        for (int k = 0; k < MAX_EXPERTS; k++) {
-            engine->cache_ids[l][k] = -1;
-            engine->cache_data[l][k] = (char*)malloc(engine->expert_size);
-            if (!engine->cache_data[l][k]) {
-                /* Cache allocation failed — disable cache, non-fatal */
-                engine->cache_enabled = 0;
-                fprintf(stderr, "[kandiga] Warning: cache alloc failed at layer %d, disabling\n", l);
-                break;
-            }
-        }
-        if (!engine->cache_enabled) break;
-    }
-
-    size_t cache_mb = engine->cache_enabled ?
-        (size_t)num_layers * MAX_EXPERTS * engine->expert_size / (1024*1024) : 0;
     fprintf(stderr, "[kandiga] Initialized: %d layers, %d expert buffers "
-            "(%zu KB each), %d-bit, cache=%zuMB\n", num_layers, MAX_EXPERTS,
-            engine->expert_size / 1024, engine->bits, cache_mb);
+            "(%zu KB each), %d-bit\n", num_layers, MAX_EXPERTS,
+            engine->expert_size / 1024, engine->bits);
 
     return engine;
 }
@@ -529,13 +492,8 @@ int bakan_cpu_expert_mlp(
 
     int fd = engine->layer_fds[layer_idx];
 
-    /* Phase 1: Load experts — cache hit uses cache buffer directly, miss preads.
-     * expert_source[k] points to where compute should read expert k's data. */
+    /* Phase 1: Parallel pread */
     __block int pread_error = 0;
-    int use_cache = engine->cache_enabled && layer_idx < MAX_CACHE_LAYERS;
-    const char* expert_source[MAX_EXPERTS];  /* where to read each expert's data */
-    int cache_hit_flags[MAX_EXPERTS];
-    memset(cache_hit_flags, 0, sizeof(cache_hit_flags));
     {
         dispatch_group_t group = dispatch_group_create();
         dispatch_queue_t io_queue = dispatch_get_global_queue(
@@ -544,34 +502,14 @@ int bakan_cpu_expert_mlp(
         size_t esz = engine->expert_size;
         for (int k = 0; k < num_experts; k++) {
             int expert_idx = expert_indices[k];
-            expert_source[k] = engine->expert_bufs[k]; /* default: pread target */
-
-            /* Check cross-token cache */
-            if (use_cache) {
-                int found = 0;
-                for (int c = 0; c < engine->cache_count[layer_idx]; c++) {
-                    if (engine->cache_ids[layer_idx][c] == expert_idx) {
-                        /* Cache hit: compute directly from cache buffer */
-                        expert_source[k] = engine->cache_data[layer_idx][c];
-                        cache_hit_flags[k] = 1;
-                        found = 1;
-                        engine->cache_hits++;
-                        break;
-                    }
+            char* buf = engine->expert_bufs[k];
+            dispatch_group_async(group, io_queue, ^{
+                off_t offset = (off_t)HEADER_SIZE + (off_t)expert_idx * (off_t)esz;
+                ssize_t n = pread(fd, buf, esz, offset);
+                if (n != (ssize_t)esz) {
+                    pread_error = 1;
                 }
-                if (!found) engine->cache_misses++;
-            }
-
-            if (!cache_hit_flags[k]) {
-                char* buf = engine->expert_bufs[k];
-                dispatch_group_async(group, io_queue, ^{
-                    off_t offset = (off_t)HEADER_SIZE + (off_t)expert_idx * (off_t)esz;
-                    ssize_t n = pread(fd, buf, esz, offset);
-                    if (n != (ssize_t)esz) {
-                        pread_error = 1;
-                    }
-                });
-            }
+            });
         }
         dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
     }
@@ -579,20 +517,6 @@ int bakan_cpu_expert_mlp(
     if (pread_error) {
         fprintf(stderr, "[kandiga] ERROR: pread failed for layer %d\n", layer_idx);
         return -1;
-    }
-
-    /* Update cache: copy pread'd (miss) experts into cache for next token.
-     * Cache hits are already in cache — no copy needed. */
-    if (use_cache) {
-        for (int k = 0; k < num_experts && k < MAX_EXPERTS; k++) {
-            if (!cache_hit_flags[k]) {
-                /* Cache miss: copy fresh data into cache */
-                memcpy(engine->cache_data[layer_idx][k],
-                       engine->expert_bufs[k], engine->expert_size);
-            }
-            engine->cache_ids[layer_idx][k] = expert_indices[k];
-        }
-        engine->cache_count[layer_idx] = num_experts;
     }
 
     /* Phase 2: Parallel expert MLP computation */
@@ -604,7 +528,7 @@ int bakan_cpu_expert_mlp(
 
         int use_3bit = (engine->bits == 3);
         for (int k = 0; k < num_experts; k++) {
-            const char* expert_data = expert_source[k];
+            const char* expert_data = engine->expert_bufs[k];
             float* expert_output = output_f32 + k * HIDDEN_SIZE;
             dispatch_group_async(group, compute_queue, ^{
                 int ret = use_3bit
@@ -814,21 +738,6 @@ void bakan_cpu_expert_destroy(void* engine_ptr) {
     for (int i = 0; i < MAX_EXPERTS; i++) {
         if (engine->expert_bufs[i]) {
             free(engine->expert_bufs[i]);
-        }
-    }
-
-    /* Free cross-token cache */
-    if (engine->cache_hits + engine->cache_misses > 0) {
-        uint64_t total = engine->cache_hits + engine->cache_misses;
-        fprintf(stderr, "[kandiga] Cache stats: %llu hits / %llu total (%.1f%% hit rate)\n",
-                engine->cache_hits, total,
-                (double)engine->cache_hits / total * 100.0);
-    }
-    for (int l = 0; l < MAX_CACHE_LAYERS && l < engine->num_layers; l++) {
-        for (int k = 0; k < MAX_EXPERTS; k++) {
-            if (engine->cache_data[l][k]) {
-                free(engine->cache_data[l][k]);
-            }
         }
     }
 
