@@ -78,17 +78,24 @@ def setup_gemma4(model_path: str):
     # Resolve model path
     from huggingface_hub import snapshot_download
     local_path = snapshot_download(model_path, local_files_only=True)
-    safetensors_path = os.path.join(local_path, "model.safetensors")
-    assert os.path.isfile(safetensors_path), f"Not found: {safetensors_path}"
 
-    # Output directory
-    cache_dir = os.path.expanduser("~/.kandiga/experts/gemma-4-26b-a4b-it-4bit")
+    # Find safetensors files (single or sharded)
+    import glob
+    st_files = sorted(glob.glob(os.path.join(local_path, "model*.safetensors")))
+    st_files = [f for f in st_files if "index" not in f]
+    assert st_files, f"No safetensors files found in {local_path}"
+
+    # Output directory — use model name from path
+    model_name = model_path.split("/")[-1]
+    cache_dir = os.path.expanduser(f"~/.kandiga/experts/{model_name}")
     packed_dir = os.path.join(cache_dir, "packed")
     os.makedirs(packed_dir, exist_ok=True)
 
-    print(f"Loading weights from {safetensors_path}...")
+    print(f"Loading weights from {len(st_files)} shard(s)...")
     t0 = time.time()
-    weights = mx.load(safetensors_path)
+    weights = {}
+    for sf in st_files:
+        weights.update(mx.load(sf))
     print(f"Loaded in {time.time()-t0:.1f}s")
 
     # Process each layer
@@ -98,31 +105,49 @@ def setup_gemma4(model_path: str):
 
     for layer_idx in range(NUM_LAYERS):
         layer_start = time.time()
-        prefix = f"model.language_model.layers.{layer_idx}.experts"
 
-        # Get fused expert tensors for this layer
-        gate_up_w = weights[f"{prefix}.gate_up_proj"]       # (128, 1408, cols_w)
-        gate_up_s = weights[f"{prefix}.gate_up_proj_scales"] # (128, 1408, cols_s)
-        gate_up_b = weights[f"{prefix}.gate_up_proj_biases"] # (128, 1408, cols_b)
-        down_w = weights[f"{prefix}.down_proj"]              # (128, 2816, cols_w2)
-        down_s = weights[f"{prefix}.down_proj_scales"]       # (128, 2816, cols_s2)
-        down_b = weights[f"{prefix}.down_proj_biases"]       # (128, 2816, cols_b2)
+        # Try both weight naming formats:
+        # Official mlx-community: language_model.model.layers.X.experts.switch_glu.{gate,up,down}_proj
+        # Philtrem: model.language_model.layers.X.experts.{gate_up_proj, down_proj}
+        prefix_a = f"language_model.model.layers.{layer_idx}.experts.switch_glu"
+        prefix_b = f"model.language_model.layers.{layer_idx}.experts"
 
-        mx.eval(gate_up_w, gate_up_s, gate_up_b, down_w, down_s, down_b)
-
-        # Split gate_up along dim 1: first half = gate, second half = up
-        half = gate_up_w.shape[1] // 2  # 704
+        if f"{prefix_a}.gate_proj.weight" in weights:
+            # Official format: already split gate/up/down
+            gate_w = weights[f"{prefix_a}.gate_proj.weight"]
+            gate_s = weights[f"{prefix_a}.gate_proj.scales"]
+            gate_b = weights[f"{prefix_a}.gate_proj.biases"]
+            up_w = weights[f"{prefix_a}.up_proj.weight"]
+            up_s = weights[f"{prefix_a}.up_proj.scales"]
+            up_b = weights[f"{prefix_a}.up_proj.biases"]
+            down_w = weights[f"{prefix_a}.down_proj.weight"]
+            down_s = weights[f"{prefix_a}.down_proj.scales"]
+            down_b = weights[f"{prefix_a}.down_proj.biases"]
+            mx.eval(gate_w, gate_s, gate_b, up_w, up_s, up_b, down_w, down_s, down_b)
+        elif f"{prefix_b}.gate_up_proj" in weights:
+            # Philtrem format: fused gate_up_proj
+            gate_up_w = weights[f"{prefix_b}.gate_up_proj"]
+            gate_up_s = weights[f"{prefix_b}.gate_up_proj_scales"]
+            gate_up_b = weights[f"{prefix_b}.gate_up_proj_biases"]
+            down_w = weights[f"{prefix_b}.down_proj"]
+            down_s = weights[f"{prefix_b}.down_proj_scales"]
+            down_b = weights[f"{prefix_b}.down_proj_biases"]
+            mx.eval(gate_up_w, gate_up_s, gate_up_b, down_w, down_s, down_b)
+            half = gate_up_w.shape[1] // 2
+            gate_w, gate_s, gate_b = gate_up_w[:, :half], gate_up_s[:, :half], gate_up_b[:, :half]
+            up_w, up_s, up_b = gate_up_w[:, half:], gate_up_s[:, half:], gate_up_b[:, half:]
+        else:
+            raise KeyError(f"No expert weights found for layer {layer_idx}")
 
         # Compute expert size and header from first expert of first layer
         if expert_size is None:
-            # Build tensor info for header
             expert_tensors = {
-                "gate_proj.weight": gate_up_w[0, :half],
-                "gate_proj.scales": gate_up_s[0, :half],
-                "gate_proj.biases": gate_up_b[0, :half],
-                "up_proj.weight": gate_up_w[0, half:],
-                "up_proj.scales": gate_up_s[0, half:],
-                "up_proj.biases": gate_up_b[0, half:],
+                "gate_proj.weight": gate_w[0],
+                "gate_proj.scales": gate_s[0],
+                "gate_proj.biases": gate_b[0],
+                "up_proj.weight": up_w[0],
+                "up_proj.scales": up_s[0],
+                "up_proj.biases": up_b[0],
                 "down_proj.weight": down_w[0],
                 "down_proj.scales": down_s[0],
                 "down_proj.biases": down_b[0],
@@ -147,17 +172,16 @@ def setup_gemma4(model_path: str):
         with open(out_path, "wb") as f:
             f.write(header)
             for eidx in range(NUM_EXPERTS):
-                # Split this expert's tensors
                 parts = [
-                    _tensor_to_bytes(gate_up_w[eidx, :half]),   # gate weight
-                    _tensor_to_bytes(gate_up_s[eidx, :half]),   # gate scales
-                    _tensor_to_bytes(gate_up_b[eidx, :half]),   # gate biases
-                    _tensor_to_bytes(gate_up_w[eidx, half:]),   # up weight
-                    _tensor_to_bytes(gate_up_s[eidx, half:]),   # up scales
-                    _tensor_to_bytes(gate_up_b[eidx, half:]),   # up biases
-                    _tensor_to_bytes(down_w[eidx]),             # down weight
-                    _tensor_to_bytes(down_s[eidx]),             # down scales
-                    _tensor_to_bytes(down_b[eidx]),             # down biases
+                    _tensor_to_bytes(gate_w[eidx]),   # gate weight
+                    _tensor_to_bytes(gate_s[eidx]),   # gate scales
+                    _tensor_to_bytes(gate_b[eidx]),   # gate biases
+                    _tensor_to_bytes(up_w[eidx]),     # up weight
+                    _tensor_to_bytes(up_s[eidx]),     # up scales
+                    _tensor_to_bytes(up_b[eidx]),     # up biases
+                    _tensor_to_bytes(down_w[eidx]),   # down weight
+                    _tensor_to_bytes(down_s[eidx]),   # down scales
+                    _tensor_to_bytes(down_b[eidx]),   # down biases
                 ]
                 f.write(b"".join(parts))
 

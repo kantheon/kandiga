@@ -45,6 +45,7 @@ typedef struct {
     int     hidden_size;
     int     expert_dim;
     int     bits;             /* 3 or 4 — auto-detected from expert_size */
+    int     use_gelu;         /* 0=SiLU (Qwen), 1=GELU (Gemma 4) */
 
     size_t  gate_w_off, gate_s_off, gate_b_off;
     size_t  up_w_off,   up_s_off,   up_b_off;
@@ -105,8 +106,13 @@ static int parse_header(int fd, Engine* e) {
         e->bits = 4;
     }
 
-    fprintf(stderr, "[kandiga-lg] h=%d e=%d esz=%zu n=%d bits=%d\n",
-            e->hidden_size, e->expert_dim, e->expert_size, e->num_experts_total, e->bits);
+    /* Detect activation: Gemma 4 uses GeGLU (expert_dim=704), Qwen uses SwiGLU */
+    /* expert_dim 704 = Gemma 4, 512/1024 = Qwen */
+    e->use_gelu = (e->expert_dim == 704) ? 1 : 0;
+
+    fprintf(stderr, "[kandiga-lg] h=%d e=%d esz=%zu n=%d bits=%d act=%s\n",
+            e->hidden_size, e->expert_dim, e->expert_size, e->num_experts_total, e->bits,
+            e->use_gelu ? "gelu" : "silu");
     return 0;
 }
 
@@ -228,10 +234,27 @@ static int expert_mlp(const Engine* e, const char* data,
                 (const uint16_t*)(data+e->up_b_off), x, uo, ed, h, GROUP_SIZE);
     }
 
-    for(int i=0;i<ed;i+=4){
-        float s0=go[i]/(1+expf(-go[i])), s1=go[i+1]/(1+expf(-go[i+1]));
-        float s2=go[i+2]/(1+expf(-go[i+2])), s3=go[i+3]/(1+expf(-go[i+3]));
-        act[i]=s0*uo[i]; act[i+1]=s1*uo[i+1]; act[i+2]=s2*uo[i+2]; act[i+3]=s3*uo[i+3];
+    if (e->use_gelu) {
+        /* GeGLU: gelu_approx(gate) * up — used by Gemma 4 */
+        /* gelu_approx(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) */
+        for(int i=0;i<ed;i+=4){
+            float g0=go[i],g1=go[i+1],g2=go[i+2],g3=go[i+3];
+            float t0=0.7978845608f*(g0+0.044715f*g0*g0*g0);
+            float t1=0.7978845608f*(g1+0.044715f*g1*g1*g1);
+            float t2=0.7978845608f*(g2+0.044715f*g2*g2*g2);
+            float t3=0.7978845608f*(g3+0.044715f*g3*g3*g3);
+            act[i]  =0.5f*g0*(1+tanhf(t0))*uo[i];
+            act[i+1]=0.5f*g1*(1+tanhf(t1))*uo[i+1];
+            act[i+2]=0.5f*g2*(1+tanhf(t2))*uo[i+2];
+            act[i+3]=0.5f*g3*(1+tanhf(t3))*uo[i+3];
+        }
+    } else {
+        /* SwiGLU: silu(gate) * up — used by Qwen 3.5 */
+        for(int i=0;i<ed;i+=4){
+            float s0=go[i]/(1+expf(-go[i])), s1=go[i+1]/(1+expf(-go[i+1]));
+            float s2=go[i+2]/(1+expf(-go[i+2])), s3=go[i+3]/(1+expf(-go[i+3]));
+            act[i]=s0*uo[i]; act[i+1]=s1*uo[i+1]; act[i+2]=s2*uo[i+2]; act[i+3]=s3*uo[i+3];
+        }
     }
 
     if (e->bits == 3) {

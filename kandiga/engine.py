@@ -834,9 +834,29 @@ class KandigaEngine:
             self._ready = True
             return
 
-        # Step 2: Load model with lazy weights (MoE path — unchanged)
-        self._model, self._tokenizer = load(self.model_path, lazy=True)
-        self._log("Model structure loaded (lazy)")
+        # Step 2: Load model with lazy weights (MoE path)
+        # Gemma 4 requires mlx-vlm for correct model class; others use mlx-lm
+        if "gemma-4" in self.model_path or "gemma4" in self.model_path:
+            try:
+                from mlx_vlm import load as vlm_load
+                _vlm_model, _vlm_proc = vlm_load(self.model_path, lazy=True)
+                # Wrap the language model so __call__ returns raw logits
+                # (mlx_lm.generate expects tensor output, not LanguageModelOutput)
+                lm = _vlm_model.language_model if hasattr(_vlm_model, 'language_model') else _vlm_model
+                _orig_call = lm.__class__.__call__
+                def _logits_call(self_inner, *args, **kwargs):
+                    out = _orig_call(self_inner, *args, **kwargs)
+                    return out.logits if hasattr(out, 'logits') else out
+                lm.__class__.__call__ = _logits_call
+                self._model = lm
+                self._tokenizer = _vlm_proc.tokenizer if hasattr(_vlm_proc, 'tokenizer') else _vlm_proc
+                self._log("Model structure loaded via mlx-vlm (Gemma 4)")
+            except ImportError:
+                self._model, self._tokenizer = load(self.model_path, lazy=True)
+                self._log("Model structure loaded (lazy) — install mlx-vlm for best Gemma 4 support")
+        else:
+            self._model, self._tokenizer = load(self.model_path, lazy=True)
+            self._log("Model structure loaded (lazy)")
 
         # Step 2b: Auto-detect expert pattern (Qwen=switch_mlp, Gemma4=switch_glu)
         flat_keys = [k for k, _ in tree_flatten(self._model.parameters())]
@@ -849,18 +869,39 @@ class KandigaEngine:
         # Step 3: Detect model dimensions
         hidden_size = 2048  # default (35B)
         is_large = False
-        # Try model.language_model.args.hidden_size (Qwen3.5 structure)
-        lm = getattr(self._model, 'language_model', None)
-        if lm and hasattr(lm, 'args'):
-            hs = getattr(lm.args, 'hidden_size', 2048)
-            if hs != 2048:
-                hidden_size = hs
-                is_large = True
-        if not is_large and hasattr(self._model, 'args'):
-            hs = getattr(self._model.args, 'hidden_size', 2048)
-            if hs != 2048:
-                hidden_size = hs
-                is_large = True
+        # Try multiple paths to find hidden_size
+        for obj in [
+            getattr(self._model, 'language_model', None),
+            self._model,
+            getattr(self._model, 'model', None),
+        ]:
+            if obj is None:
+                continue
+            for attr in ['args', 'config']:
+                a = getattr(obj, attr, None)
+                if a and hasattr(a, 'hidden_size'):
+                    hs = a.hidden_size
+                    if hs != 2048:
+                        hidden_size = hs
+                        is_large = True
+                        break
+            if is_large:
+                break
+        # Fallback: check first layer's attention projection shape
+        if not is_large:
+            try:
+                layers = _find_layers(self._model)
+                if layers and hasattr(layers[0], 'self_attn'):
+                    q = getattr(layers[0].self_attn, 'q_proj', None)
+                    if q and hasattr(q, 'weight'):
+                        # weight shape: (out, in_packed) — out = num_heads * head_dim
+                        # For the hidden_size, check the input dim via scales
+                        if hasattr(q, 'scales'):
+                            hidden_size = q.scales.shape[-1] * (q.group_size if hasattr(q, 'group_size') else 64)
+                            if hidden_size != 2048:
+                                is_large = True
+            except Exception:
+                pass
         if is_large:
             self._log(f"Large model: hidden_size={hidden_size}")
 
