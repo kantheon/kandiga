@@ -14,15 +14,15 @@ Kandiga is an open-source MoE inference engine + AI agent for Apple Silicon. Run
 
 ## Supported Models
 
-| Model | Parameters | Active | Disk | Kandiga RAM | Decode | Status |
-|-------|-----------|--------|------|-------------|--------|--------|
-| Qwen3.5-4B (3-bit) | 4B | 4B | 1.84 GB | ~1.8 GB | **136 tok/s** | Proven |
-| Qwen3.5-4B (4-bit) | 4B | 4B | 2.4 GB | ~2.4 GB | 112 tok/s | Proven |
-| Qwen3.5-35B-A3B (full 3-bit) | 35B | 3B | 20 GB | **~1 GB** | **8.1 tok/s** | Proven |
-| Qwen3.5-35B-A3B (4-bit) | 35B | 3B | 20 GB | ~1.4 GB | 6.7 tok/s | Proven |
-| Qwen3.5-122B-A10B (full 3-bit) | 122B | 10B | 70 GB | **~2.7 GB** | **2.2 tok/s** | Proven |
-| Qwen3.5-122B-A10B (4-bit) | 122B | 10B | 70 GB | ~3.5 GB | 1.3 tok/s | Proven |
-| Qwen3.5-397B-A17B (full 3-bit) | 397B | 17B | 224 GB | est. ~5 GB | est. 0.3-0.5 tok/s | Pending |
+| Model | Parameters | Active | Disk | Kandiga RAM | Decode* | Status |
+|-------|-----------|--------|------|-------------|---------|--------|
+| Qwen3.5-4B (3-bit) | 4B | 4B | 1.84 GB | ~1.8 GB | **31 tok/s** | Proven |
+| Qwen3.5-35B-A3B (full 3-bit) | 35B | 3B | 20 GB | **~1 GB** | **~12 tok/s** | Proven |
+| Qwen3.5-122B-A10B (full 3-bit) | 122B | 10B | 70 GB | **~2.7 GB** | **~4 tok/s** | Proven |
+| Gemma 4 26B-A4B | 26B | 4B | 13 GB | **~1.35 GB** | **~10 tok/s** | Proven |
+| Qwen3.5-397B-A17B (full 3-bit) | 397B | 17B | 224 GB | est. ~5 GB | est. ~1 tok/s | Pending |
+
+*MoE decode speed depends on SSD bandwidth. Estimates for internal NVMe on M4.
 
 ## Install
 
@@ -94,8 +94,9 @@ Conversion: one-time `dequant 4-bit → requant 3-bit → save safetensors`. Mod
 
 | Model | 4-bit | Full 3-bit | Speed gain | GPU savings |
 |-------|-------|------------|------------|-------------|
-| 35B-A3B | 6.7 tok/s, 1.4 GB | **8.1 tok/s, 1.0 GB** | **+21%** | **-22%** |
-| 122B-A10B | 1.3 tok/s, 3.5 GB | **2.2 tok/s, 2.7 GB** | **+69%** | **-22%** |
+| 35B-A3B | ~8 tok/s, 1.4 GB | **~12 tok/s, 1.0 GB** | **+50%** | **-22%** |
+| 122B-A10B | ~2 tok/s, 3.5 GB | **~4 tok/s, 2.7 GB** | **+100%** | **-22%** |
+| Gemma 4 26B-A4B | N/A | **~10 tok/s, 1.35 GB** | — | — |
 
 Conversion (one-time):
 ```bash
@@ -124,24 +125,27 @@ Kandiga includes a full AI agent with native Qwen3.5 tool calling:
 
 | Task | Time | Tools Used |
 |------|------|-----------|
-| Hello | 2-6s | — |
-| List files | 15s | list_dir |
-| Read CSV + calculate | 60s | read_file |
-| Create script + run | 70s | write_file, run_shell |
-| Web search + notify | 49s | web_search, notify |
-| Multi-step (5 tools) | 105s | list_dir, read_file ×3, write_file |
+| Hello | 2.5s | — |
+| List files | 3s | list_dir |
+| Create + run script | 6s | write_file, run_shell |
+| Web search | 3s | web_search |
+| Math (127 × 389) | 3s | — (direct) |
+| What time is it | 3s | — (injected) |
+| Delete file | 5s | run_shell |
+| Recall turn 1 at turn 44 | 8s | — (KV cache) |
 
-10/10 multi-turn test passed. KV cache maintains context across all turns.
+95% accuracy on 44-turn multi-turn conversation. Persistent KV cache maintains context across all turns. 3.1s average per turn.
 
 ## Performance (M4 Mac Mini, 16GB)
 
-| Model | Mode | Decode | TTFT | Follow-up TTFT | RAM |
-|-------|------|--------|------|----------------|-----|
-| Qwen3.5-4B (3-bit) | dense | **136 tok/s** | <1s | <1s | 1.8 GB |
-| Qwen3.5-35B (full 3-bit) | K=4 | **8.1 tok/s** | 3-8s | **2-4s** | ~1 GB |
-| Qwen3.5-35B (4-bit) | K=4 | 6.7 tok/s | 3-8s | **2-4s** | ~1.4 GB |
-| Qwen3.5-122B (full 3-bit) | K=4 | **2.2 tok/s** | 11-18s | **11-15s** | ~2.7 GB |
-| Qwen3.5-122B (4-bit) | K=4 | 1.3 tok/s | 11-18s | **11-15s** | ~3.5 GB |
+| Model | Mode | Decode* | Follow-up TTFT | RAM |
+|-------|------|---------|----------------|-----|
+| Qwen3.5-4B (3-bit) | dense | **31 tok/s** | <1s | 1.8 GB |
+| Qwen3.5-35B (full 3-bit) | K=4 | **~12 tok/s** | **2-4s** | ~1 GB |
+| Qwen3.5-122B (full 3-bit) | K=4 | **~4 tok/s** | **5-10s** | ~2.7 GB |
+| Gemma 4 26B-A4B | K=4 | **~10 tok/s** | **2-4s** | ~1.35 GB |
+
+*MoE decode speed depends on SSD bandwidth. Estimates for M4 internal NVMe.
 
 Follow-up TTFT is constant regardless of conversation length thanks to persistent KV cache.
 
