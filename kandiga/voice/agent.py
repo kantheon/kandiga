@@ -55,9 +55,12 @@ class VoiceAgent:
         mem1 = mx.get_active_memory() / 1e9
         print(f"  GPU after STT: {mem1:.2f} GB")
 
-        # 2. LLM (Kandiga 35B SEM)
+        # 2. LLM (Qwen 3.5 4B 3-bit — 136 tok/s, persistent KV cache)
         from kandiga.engine import KandigaEngine
-        self._llm = KandigaEngine(fast_mode=True)
+        self._llm = KandigaEngine(
+            model_path="mlx-community/Qwen3.5-4B-3bit",
+            fast_mode=False,  # dense model, no K setting
+        )
         self._llm.load()
         mem2 = mx.get_active_memory() / 1e9
         print(f"  GPU after LLM: {mem2:.2f} GB")
@@ -100,7 +103,7 @@ class VoiceAgent:
         response_tokens = []
         for token in self._llm.session_generate(
             user_text,
-            max_tokens=60,  # short for conversational responses
+            max_tokens=30,  # phone-agent short: ~2-3 seconds of speech
             temp=0.0,
         ):
             response_tokens.append(token)
