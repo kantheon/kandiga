@@ -49,7 +49,10 @@ class VoiceTTS:
         # sufficient for audio codec work and halves the memory.
         saved = self._optimize_speech_tokenizer()
 
-        # --- Optimization 2: Pre-extract speaker embedding, free encoder ---
+        # --- Optimization 2: Quantize KV cache (4x compression) ---
+        self._patch_kv_cache_quantization()
+
+        # --- Optimization 3: Pre-extract speaker embedding, free encoder ---
         # The encoder is only needed to process the reference audio for
         # voice cloning. Once we have the embedding, the encoder weights
         # (~200 MB) can be freed.
@@ -64,24 +67,21 @@ class VoiceTTS:
               f"active={current:.2f}GB peak={peak:.2f}GB")
 
     def _optimize_speech_tokenizer(self) -> float:
-        """Cast speech tokenizer from float32 to float16."""
+        """Cast ALL speech tokenizer weights from float32 to float16.
+
+        Walks every module and casts weight/bias in-place.
+        Halves the 682 MB speech tokenizer to ~341 MB.
+        """
         st = self._model.speech_tokenizer
         saved_bytes = 0
 
         for name, module in st.named_modules():
-            if hasattr(module, 'weight') and module.weight.dtype == mx.float32:
-                old_bytes = module.weight.nbytes
-                module.weight = module.weight.astype(mx.float16)
-                saved_bytes += old_bytes - module.weight.nbytes
+            for attr in ('weight', 'bias'):
+                param = getattr(module, attr, None)
+                if param is not None and param.dtype == mx.float32:
+                    saved_bytes += param.nbytes // 2
+                    setattr(module, attr, param.astype(mx.float16))
 
-            # Also cast any biases
-            if hasattr(module, 'bias') and module.bias is not None:
-                if module.bias.dtype == mx.float32:
-                    old_bytes = module.bias.nbytes
-                    module.bias = module.bias.astype(mx.float16)
-                    saved_bytes += old_bytes - module.bias.nbytes
-
-        mx.eval(tree_flatten(st.parameters()))
         return saved_bytes / 1e6
 
     def _pre_extract_and_free_encoder(self, voice: str):
@@ -109,6 +109,30 @@ class VoiceTTS:
             import gc
             gc.collect()
             print(f"[voice-tts] Freed encoder: ~{params_before/1e6:.0f}MB")
+
+    def _patch_kv_cache_quantization(self):
+        """Reduce TTS generation memory by converting model to float16.
+
+        The talker model's linear layers may use float32 for activations.
+        Force float16 throughout to cut working memory.
+        """
+        import mlx.nn as nn
+
+        talker = self._model.talker
+        # Cast all non-quantized linear layers to float16
+        saved = 0
+        for name, module in talker.named_modules():
+            if isinstance(module, nn.Linear) and not hasattr(module, 'scales'):
+                if module.weight.dtype == mx.float32:
+                    old = module.weight.nbytes
+                    module.weight = module.weight.astype(mx.float16)
+                    saved += old - module.weight.nbytes
+                    if hasattr(module, 'bias') and module.bias is not None:
+                        if module.bias.dtype == mx.float32:
+                            module.bias = module.bias.astype(mx.float16)
+
+        if saved > 0:
+            print(f"[voice-tts] Talker float32→float16: saved {saved/1e6:.0f}MB")
 
     def speak(self, text: str, stream: bool = True):
         """Generate speech from text. Yields (sample_rate, audio_array) chunks.
