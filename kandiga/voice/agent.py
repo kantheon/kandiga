@@ -27,17 +27,18 @@ class VoiceAgent:
     ):
         self.voice = voice
         self.system_prompt = system_prompt or (
-            "You are a friendly, professional medical office receptionist. "
-            "You help callers schedule appointments, answer questions about "
-            "office hours, and provide general information. Keep responses "
-            "short and conversational — 1-2 sentences max. Be warm and helpful."
+            "You are Sarah, the receptionist at Dr. Smith's Family Medicine office. "
+            "Office hours are Monday-Friday 8am-5pm. You can schedule appointments, "
+            "answer questions, and help callers. You have access to the schedule. "
+            "Keep responses SHORT — 1-2 sentences only. Be warm, natural, conversational. "
+            "Never say you are an AI. Never refuse to help. Just act like a real receptionist."
         )
 
         self._stt = None
         self._tts = None
         self._llm = None
         self._ready = False
-        self._conversation = []
+        self._session_started = False
 
     def load(self):
         """Load all models. Reports memory at each stage."""
@@ -77,31 +78,32 @@ class VoiceAgent:
         self._ready = True
 
     def process_text(self, user_text: str) -> str:
-        """Process text input through LLM."""
+        """Process text input through LLM with persistent KV cache.
+
+        Turn 1: processes system prompt + user message (~2-3s TTFT)
+        Turn 2+: only processes new user message (~1-2s TTFT)
+        """
         import re
 
-        self._conversation.append({"role": "user", "content": user_text})
+        # First call: start session and inject system prompt
+        if not self._session_started:
+            self._llm.start_session()
+            self._llm._session_history.append({
+                "role": "system",
+                "content": self.system_prompt,
+            })
+            self._session_started = True
 
-        # Format full conversation
-        messages = [{"role": "system", "content": self.system_prompt}] + self._conversation
-        try:
-            formatted = self._llm._tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        except TypeError:
-            formatted = self._llm._tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
-
-        # Generate — stop early at sentence boundaries for natural conversation
+        # session_generate only processes NEW tokens (KV cache has the rest)
+        # Don't break the generator early — it must complete to update
+        # session history and token tracking for the next turn
         response_tokens = []
-        for token in self._llm._stream_generate(formatted, max_tokens=100, temp=0.0):
+        for token in self._llm.session_generate(
+            user_text,
+            max_tokens=60,  # short for conversational responses
+            temp=0.0,
+        ):
             response_tokens.append(token)
-            # Stop at natural sentence end after minimum length
-            text_so_far = "".join(response_tokens)
-            if len(text_so_far) > 30 and text_so_far.rstrip().endswith((".", "!", "?")):
-                break
 
         response = "".join(response_tokens).strip()
 
@@ -110,7 +112,6 @@ class VoiceAgent:
         if "</think>" in response:
             response = response.split("</think>")[-1].strip()
 
-        self._conversation.append({"role": "assistant", "content": response})
         return response
 
     def speak(self, text: str):
