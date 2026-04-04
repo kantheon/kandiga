@@ -1,7 +1,7 @@
 [project]
 name = "kandiga"
-version = "0.7.1"
-description = "Run 35B-397B MoE models in 2-8GB RAM. Custom Metal GPU kernels. Any Mac."
+version = "0.8.0"
+description = "3 AI models. 161B parameters. One Mac. 5.5GB. Full agentic pipeline on Apple Silicon."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
