@@ -84,12 +84,42 @@ class VoiceTTS:
 
         return saved_bytes / 1e6
 
+    def set_voice_clone(self, ref_audio_path: str, ref_text: str):
+        """Pre-extract speaker embedding AND speech tokens from reference audio.
+
+        Call once at setup. Both are cached and reused for every subsequent
+        speak() call — no re-encoding the 11s reference audio each turn.
+        This eliminates the ~4 GB memory spike from re-processing reference audio.
+
+        Args:
+            ref_audio_path: Path to reference audio file (any format)
+            ref_text: Transcript of what's said in the reference audio
+        """
+        import librosa
+
+        audio, _ = librosa.load(ref_audio_path, sr=24000, mono=True)
+        audio_mx = mx.array(audio)
+
+        # Cache speaker embedding
+        self._speaker_embedding = self._model.extract_speaker_embedding(audio_mx)
+        mx.eval(self._speaker_embedding)
+
+        # Cache encoded speech tokens (used for ICL generation)
+        # Speech tokenizer encoder expects (1, 1, T) shaped input
+        self._cached_ref_codes = self._model.speech_tokenizer.encode(audio_mx.reshape(1, 1, -1))
+        mx.eval(self._cached_ref_codes)
+
+        self._ref_text = ref_text
+        self._ref_audio_mx = audio_mx  # keep for generate() path
+
+        print(f"[voice-tts] Voice cloned: embedding={self._speaker_embedding.shape}, "
+              f"codes={self._cached_ref_codes.shape}")
+
+        # Now free the encoder — cached data is all we need
+        self._free_encoder()
+
     def _pre_extract_and_free_encoder(self, voice: str):
-        """Extract speaker embedding once, then free encoder weights."""
-        # The model's generate() will extract the speaker embedding internally.
-        # We can't easily pre-extract it without calling the model.
-        # Instead, we'll free the encoder AFTER the first generate call.
-        # For now, just mark that we should free it after first use.
+        """Set up for preset voice (no cloning)."""
         self._should_free_encoder = True
 
     def _free_encoder(self):
@@ -134,34 +164,62 @@ class VoiceTTS:
         if saved > 0:
             print(f"[voice-tts] Talker float32→float16: saved {saved/1e6:.0f}MB")
 
-    def speak(self, text: str, stream: bool = True):
+    def speak(self, text: str, stream: bool = True, ref_audio=None, ref_text=None):
         """Generate speech from text. Yields (sample_rate, audio_array) chunks.
 
-        With stream=True, yields chunks as they're generated (low latency).
-        With stream=False, yields one chunk with the complete audio.
+        If set_voice_clone() was called, uses cached speaker embedding.
+        Otherwise pass ref_audio/ref_text for one-off cloning, or use preset voice.
         """
         if not self._ready:
             self.load()
 
-        for result in self._model.generate(
-            text=text,
-            voice=self._voice,
-            verbose=False,
-            stream=stream,
-            streaming_interval=1.5,  # yield every 1.5s of audio
-            temperature=0.9,
-            top_k=50,
-            repetition_penalty=1.05,
-        ):
-            if hasattr(result, 'audio') and result.audio is not None:
-                audio = np.array(result.audio).flatten()
-                sr = getattr(result, 'sample_rate', 24000)
-                yield (sr, audio)
+        # Build kwargs — inject cached embeddings if voice clone was set up
+        kwargs = {}
+        _patches = {}
+        if self._speaker_embedding is not None and self._cached_ref_codes is not None:
+            # Monkey-patch both encoder functions to return cached data
+            _patches['extract'] = self._model.extract_speaker_embedding
+            _patches['encode'] = self._model.speech_tokenizer.encode
 
-        # Free encoder after first generation (speaker embedding now cached)
-        if self._should_free_encoder:
-            self._free_encoder()
-            self._should_free_encoder = False
+            cached_emb = self._speaker_embedding
+            cached_codes = self._cached_ref_codes
+
+            self._model.extract_speaker_embedding = lambda audio, sr=24000: cached_emb
+            self._model.speech_tokenizer.encode = lambda audio: cached_codes
+
+            # Pass ref_audio so model takes the cloning path
+            kwargs['ref_audio'] = self._ref_audio_mx
+            kwargs['ref_text'] = self._ref_text or ''
+        elif ref_audio is not None:
+            kwargs['ref_audio'] = ref_audio
+            kwargs['ref_text'] = ref_text or ''
+
+        try:
+            for result in self._model.generate(
+                text=text,
+                voice=self._voice,
+                verbose=False,
+                stream=stream,
+                streaming_interval=1.5,
+                temperature=0.9,
+                top_k=50,
+                repetition_penalty=1.05,
+                **kwargs,
+            ):
+                if hasattr(result, 'audio') and result.audio is not None:
+                    audio = np.array(result.audio).flatten()
+                    sr = getattr(result, 'sample_rate', 24000)
+                    yield (sr, audio)
+        finally:
+            # Restore monkey-patched methods
+            if 'extract' in _patches:
+                self._model.extract_speaker_embedding = _patches['extract']
+            if 'encode' in _patches:
+                self._model.speech_tokenizer.encode = _patches['encode']
+
+            if self._should_free_encoder:
+                self._free_encoder()
+                self._should_free_encoder = False
 
     def speak_full(self, text: str) -> tuple:
         """Generate complete audio. Returns (sample_rate, audio_array)."""
