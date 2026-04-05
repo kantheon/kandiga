@@ -68,6 +68,11 @@ def read_file(path: str) -> str:
         # Auto-fix: they meant list_dir, not read_file
         entries = sorted(os.listdir(path))[:50]
         return "This is a directory. Contents:\n" + "\n".join(f"  {e}{'/' if os.path.isdir(os.path.join(path,e)) else ''}" for e in entries)
+    # Auto-fix: image files → analyze_image
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"):
+        from kandiga.agents.vision import analyze_image
+        return analyze_image(path, "Describe this image in detail. Identify everything you see.")
     if not os.path.isfile(path):
         return f"Error: file not found: {path}"
     try:
